@@ -1,0 +1,46 @@
+{
+  "name": "dsh-plugin-whale",
+  "version": "1.2.0",
+  "description": "DSH 对话界面美化插件：余额粮仓、游动蓝鲸状态条、峰谷谷价、消遣小游戏与定时发送。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "client-plugin",
+    "ui",
+    "beautify",
+    "whale",
+    "scheduled-send"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  }
+}
