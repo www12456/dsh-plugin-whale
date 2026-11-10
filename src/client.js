@@ -1,0 +1,4137 @@
+/* dsh-plugin-whale — browser half source.
+ * 构建：python3 build_plugin.py  （把几何与图标注入后包成 ModuleLoader 模块）
+ *
+ * 组成：
+ *   1) 侧边栏底部的粮仓按钮 + 余额弹层（充值 / 赠送 / 累计消费·本日消费）
+ *   2) 输入框下方的游动蓝鲸状态条（静止 / 思考中 / 工作中 + 捕食）
+ *   3) 设置面板里的两行：余额展示口径、鲸鱼缩放
+ *   4) 定时发送：输入框工具行的沙漏 + 时间面板 + 输入框上方的等待卡片
+ *      （合并自 dsh-plugin-timed-send，见本目录 README）
+ */
+/*__GEOM__*/
+
+const React = require('react');
+const ReactDOM = require('react-dom');
+const h = React.createElement;
+const { useRef, useEffect, useState, useCallback, useSyncExternalStore } = React;
+
+/* ------------------------------------------------------------------ 图标 */
+
+const ICONS = /*__ICONS__*/{};
+
+function Icon({ name, size = 20 }) {
+  const icon = ICONS[name] || ICONS.granary;
+  const main = icon.main.map((d, i) => h('path', { key: 'm' + i, d }));
+  const fine = icon.fine.map((d, i) => h('path', { key: 'f' + i, d }));
+  return h('svg', {
+    viewBox: '0 0 24 24', width: size, height: size, fill: 'none',
+    stroke: 'currentColor', strokeLinecap: 'round', strokeLinejoin: 'round',
+    'aria-hidden': true,
+  }, h('g', { strokeWidth: 1.6 }, main), h('g', { strokeWidth: 1.1 }, fine));
+}
+
+/* ------------------------------------------------------------ 设置存储 */
+/* 走 host 的 settings seam：宿主半边注册命名空间与 schema，
+ * 浏览器半边通过 ctx.settingsScope 读写，落在 dsh 的用户设置文档里。 */
+const PLUGIN_VERSION = '1.2.0';
+const DEFAULTS = { whaleScale: 1.0, alertThreshold: 30, greenBrightness: 1.3, showDiagnostics: true, whaleStyle: 'line', snackSpeed: 1.0 };
+const SETTINGS_SCHEMA = {
+  alertThreshold: {
+    label: '余额预警',
+    desc: '总余额低于这个金额时，粮仓图标变成橙色（填 0 关闭预警）',
+  },
+  whaleScale: {
+    label: '鲸鱼缩放',
+    desc: '输入框下方状态条的整体大小',
+  },
+  snackSpeed: {
+    label: '零食速度',
+    desc: '消遣模式里零食向右漂的速度；调快后落点判定的时间窗口会变短',
+  },
+};
+
+let scope = null;
+let remote = null;
+let clientCtx = null;
+const toneRefreshers = new Set();
+/** 用量账本一变就通知弹层重算「今日消耗」（250ms 合并突发更新）。 */
+const usageListeners = new Set();
+let usageNotifyTimer = 0;
+function notifyUsageChanged() {
+  if (usageNotifyTimer) return;
+  usageNotifyTimer = setTimeout(() => {
+    usageNotifyTimer = 0;
+    usageListeners.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+  }, 250);
+}
+function onUsageChanged(fn) { usageListeners.add(fn); return () => usageListeners.delete(fn); }
+
+/** 账户服务就绪后补一次取数并重新着色（挂载时服务可能还没到）。 */
+function applyToneAll() {
+  toneRefreshers.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+}
+
+function refreshBalanceTone() {
+  Promise.resolve(fetchBalance()).then(() => {
+    toneRefreshers.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+  }).catch(() => {});
+}
+let scopeUnsub = null;
+const settingListeners = new Set();
+
+function clampScale(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return DEFAULTS.whaleScale;
+  return Math.min(1.4, Math.max(0.7, Math.round(n * 100) / 100));
+}
+
+function clampBrightness(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULTS.greenBrightness;
+  return Math.min(2.4, Math.max(0.6, Math.round(n * 100) / 100));
+}
+
+function clampThreshold(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return DEFAULTS.alertThreshold;
+  return Math.min(10000, Math.round(n * 100) / 100);
+}
+
+function clampSnackSpeed(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return DEFAULTS.snackSpeed;
+  return Math.min(2, Math.max(0.5, Math.round(n * 10) / 10));
+}
+
+function normalize(value) {
+  const v = value || {};
+  return {
+    whaleScale: clampScale(v.whaleScale),
+    alertThreshold: clampThreshold(v.alertThreshold),
+    greenBrightness: clampBrightness(v.greenBrightness),
+    showDiagnostics: v.showDiagnostics !== false,
+    whaleStyle: v.whaleStyle === 'fill' ? 'fill' : 'line',
+    snackSpeed: clampSnackSpeed(v.snackSpeed),
+  };
+}
+
+let cacheRaw = null;
+let cacheVal = DEFAULTS;
+
+/** getSnapshot 必须返回稳定引用，否则 React 判定每次都变。 */
+function readSettings() {
+  if (!scope) return normalize(localOverrides);
+  let snap;
+  try { snap = scope.getSnapshot(); } catch { return DEFAULTS; }
+  if (snap === cacheRaw) return cacheVal;
+  cacheRaw = snap;
+  cacheVal = normalize({ ...(snap && snap.value), ...localOverrides });
+  return cacheVal;
+}
+
+function bump() {
+  cacheRaw = null;
+  settingListeners.forEach((fn) => fn());
+}
+
+function bindScope(next) {
+  if (!next || next === scope) return;
+  try { if (scopeUnsub) scopeUnsub(); } catch { /* ignore */ }
+  scope = next;
+  try { scopeUnsub = scope.subscribe(() => bump()); } catch { scopeUnsub = null; }
+  bump();
+}
+
+function subscribeSettings(fn) {
+  settingListeners.add(fn);
+  return () => settingListeners.delete(fn);
+}
+
+function useSettings() {
+  return useSyncExternalStore(subscribeSettings, readSettings, () => DEFAULTS);
+}
+
+const LOCAL_SETTINGS_KEY = 'dsh-plugin-whale:settings';
+const localOverrides = (() => {
+  try {
+    const raw = window.localStorage.getItem(LOCAL_SETTINGS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch { return {}; }
+})();
+
+function persistOverrides() {
+  try {
+    window.localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify(localOverrides));
+  } catch { /* ignore */ }
+}
+
+function setSetting(field, value) {
+  const next = field === 'whaleScale' ? clampScale(value)
+    : field === 'snackSpeed' ? clampSnackSpeed(value)
+      : value;
+  localOverrides[field] = next;          // 先本地生效，UI 一定能动
+  cacheRaw = null;                       // 让 readSettings 重新合并本地覆盖
+  persistOverrides();                    // 落本地，重启后仍在
+  bump();
+  applyToneAll();                        // 让弹层/图标立即跟着新设置刷新
+  if (!scope) return;
+  try {
+    Promise.resolve(scope.set(field, next)).catch(() => { /* 宿主拒绝时保留本地值 */ });
+  } catch { /* 只读部署保留本地值 */ }
+}
+
+/** 调试钩子默认不挂到 window：排查时在 localStorage 里写 dsh-plugin-whale:debug=1 再刷新。 */
+const DEBUG_HOOKS = (() => {
+  try { return window.localStorage.getItem('dsh-plugin-whale:debug') === '1'; } catch { return false; }
+})();
+
+// 诊断信息：绑定状态 / 账户行识别结果，既暴露到 window 也显示在余额弹层底部
+const DIAG = {
+  configForms: false, settingsScope: false, scope: false,
+  remote: false, account: false, row: false, rowChildren: 0, rejected: null, balance: '',
+};
+
+/** 把本按钮往上几层 + 底部容器的子节点压成几行，方便一眼定位结构差异。 */
+function outlineText() {
+  const host = document.querySelector('[data-dsh-whale-balance]');
+  if (!host) return 'no-host';
+  const tag = (el) => el.tagName.toLowerCase() + '.' +
+    String(el.className || '').split(' ')[0].slice(0, 16) + '(' + el.childElementCount + ')';
+  const lines = [];
+  let el = host;
+  for (let i = 0; i < 4 && el; i += 1) {
+    lines.push(tag(el));
+    const parent = el.parentElement;
+    if (parent && parent.childElementCount >= 2) {
+      lines.push('└ ' + Array.from(parent.children).map(tag).join(' | '));
+      break;
+    }
+    el = parent;
+  }
+  return lines.join('\n');
+}
+
+function diagText() {
+  const yes = (v) => (v ? '✓' : '✗');
+  return 'v' + PLUGIN_VERSION + ' cf' + yes(DIAG.configForms) + ' ss' + yes(DIAG.settingsScope)
+    + ' scope' + yes(DIAG.scope) + ' acct' + yes(DIAG.account)
+    + ' bal' + (DIAG.balance || '-')
+    + ' row' + yes(DIAG.row) + '(' + DIAG.rowChildren + ')';
+}
+
+function debug(patch) {
+  Object.assign(DIAG, patch);
+  try {
+    const w = window;
+    w.__dshWhale = Object.assign(w.__dshWhale || {}, patch);
+  } catch { /* ignore */ }
+}
+
+/* ---------------------------------------------------------- 峰谷与官方校验 */
+/* 规则来源：官方定价页（api-docs.deepseek.com/zh-cn/quick_start/pricing）。
+ * 北京时间 周一至周五 9:00–12:00、14:00–18:00 为高峰；周末与法定节假日全天为谷时。 */
+const PEAK_RANGES = [[9, 12], [14, 18]];
+const STATUS_LABEL = { peak: '峰时', weekend: '周末', holiday: '节假日', valley: '谷时' };
+const GREEN_COLOR = 'rgb(34, 197, 94)';   // 默认绿（亮度设置会覆盖 stroke 值）
+/** 按亮度系数生成绿段颜色：1.0 约 46% 明度，越高越亮。 */
+function greenStrokeFor(boost) {
+  const l = Math.max(24, Math.min(84, 20 + 26 * boost));
+  // 越亮 → 饱和度越高，颜色更"浓"，不会发白
+  const sat = Math.max(64, Math.min(98, 66 + 26 * (boost - 0.6) / 1.2));
+  return 'hsl(151, ' + sat.toFixed(0) + '%, ' + l.toFixed(1) + '%)';
+}
+const HOLIDAY_VALLEY_2026 = {
+  '2026-01-01': 1, '2026-01-02': 1, '2026-01-03': 1,
+  '2026-02-15': 1, '2026-02-16': 1, '2026-02-17': 1, '2026-02-18': 1, '2026-02-19': 1,
+  '2026-02-20': 1, '2026-02-21': 1, '2026-02-22': 1, '2026-02-23': 1,
+  '2026-04-04': 1, '2026-04-05': 1, '2026-04-06': 1,
+  '2026-05-01': 1, '2026-05-02': 1, '2026-05-03': 1, '2026-05-04': 1, '2026-05-05': 1,
+  '2026-06-19': 1, '2026-06-20': 1, '2026-06-21': 1,
+  '2026-09-25': 1, '2026-09-26': 1, '2026-09-27': 1,
+  '2026-10-01': 1, '2026-10-02': 1, '2026-10-03': 1, '2026-10-04': 1,
+  '2026-10-05': 1, '2026-10-06': 1, '2026-10-07': 1,
+};
+
+function beijingParts(now = Date.now()) {
+  const d = new Date(Number(now) + 8 * 3600000);
+  const iso = d.toISOString();
+  return {
+    date: iso.slice(0, 10),
+    weekday: d.getUTCDay(),   // 0=周日
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+  };
+}
+
+/** @returns {{ peak: boolean, reason: string }} */
+let PEAK_OVERRIDE = null;   // 测试用：'peak' / 'valley'；null = 按真实时间判定
+
+function peakStatus(now = Date.now()) {
+  if (PEAK_OVERRIDE === 'peak') return { peak: true, reason: 'peak' };
+  if (PEAK_OVERRIDE === 'valley') return { peak: false, reason: 'valley' };
+  const { date, weekday, hour } = beijingParts(now);
+  if (HOLIDAY_VALLEY_2026[date]) return { peak: false, reason: 'holiday' };
+  if (weekday === 0 || weekday === 6) return { peak: false, reason: 'weekend' };
+  const peak = PEAK_RANGES.some(([from, to]) => hour >= from && hour < to);
+  return { peak, reason: peak ? 'peak' : 'valley' };
+}
+
+const OFFICIAL_PRICING_URL = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing';
+const CHECK_KEY = 'dsh-plugin-whale:official-check';
+const CHECK_TTL_MS = 24 * 3600 * 1000;
+let officialCheck = (() => {
+  try {
+    const raw = window.localStorage.getItem(CHECK_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && Number.isFinite(parsed.at)) return parsed;
+  } catch { /* ignore */ }
+  return { at: 0, ok: null, error: '' };
+})();
+
+function officialCheckFresh() {
+  return officialCheck.at > 0 && Date.now() - officialCheck.at < CHECK_TTL_MS;
+}
+
+function notifyOfficialCheck() {
+  try {
+    toneRefreshers.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+  } catch { /* ignore */ }
+}
+
+/** 每日一次连通性校验：连不上官方文档页就在粮仓图标右上角打红点。 */
+/** 单次连通性探测（no-cors，只关心抛不抛错）。 */
+async function probeOfficialPage() {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 8000) : 0;
+  try {
+    await fetch(OFFICIAL_PRICING_URL, {
+      mode: 'no-cors',
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined,
+    });
+    return { ok: true, error: '' };
+  } catch (error) {
+    return { ok: false, error: String((error && error.message) || error).slice(0, 120) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function ensureOfficialCheck(force = false) {
+  if (!force && officialCheckFresh()) return officialCheck;
+  let result = await probeOfficialPage();
+  if (!result.ok && !force) {
+    // 一次失败可能只是瞬时抖动：3 秒后再试一次，仍失败才亮红点
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    result = await probeOfficialPage();
+  }
+  officialCheck = { at: Date.now(), ok: result.ok, error: result.error };
+  try { window.localStorage.setItem(CHECK_KEY, JSON.stringify(officialCheck)); } catch { /* ignore */ }
+  DIAG.official = officialCheck.ok ? 'ok' : 'fail:' + officialCheck.error;
+  notifyOfficialCheck();
+  return officialCheck;
+}
+
+/* -------------------------------------------------------------- 余额数据 */
+/* 走官方账户 remote：normal_wallets = 充值余额，bonus_wallets = 赠送余额。
+ * 平台没有暴露“累计消费/本日消费”，口径为 daily 时第三行显示占位说明。 */
+const CURRENCY_SYMBOL = { CNY: '¥', USD: '$' };
+
+function normalizeWallets(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((w) => w && typeof w.balance === 'string' && CURRENCY_SYMBOL[w.currency])
+    .map((w) => ({ currency: w.currency, amount: Number(w.balance) || 0 }));
+}
+
+function sumWallets(list) {
+  const byCurrency = new Map();
+  list.forEach((w) => byCurrency.set(w.currency, (byCurrency.get(w.currency) || 0) + w.amount));
+  return [...byCurrency.entries()].map(([currency, amount]) => ({ currency, amount }));
+}
+
+function formatMoney(list) {
+  if (!list.length) return '—';
+  return list
+    .map(({ currency, amount }) => `${CURRENCY_SYMBOL[currency]}${amount.toLocaleString(undefined, {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    })}`)
+    .join(' / ');
+}
+
+/** 账户 remote 必须在被注入的子 context 上取：根 ctx 访问未注入的服务会抛错。 */
+let injectedCtx = null;
+
+function accountApi() {
+  const candidates = [];
+  const push = (label, api) => {
+    try {
+      if (api && typeof api.getBalance === 'function') candidates.push([label, api]);
+      else if (api) DIAG.seen = (DIAG.seen ? DIAG.seen + ' | ' : '') + label + ':' + Object.keys(api).slice(0, 8).join(',');
+    } catch { /* ignore */ }
+  };
+  if (injectedCtx) {
+    try { push('child.remote.account', injectedCtx.remote && injectedCtx.remote.account); } catch { /* ignore */ }
+    try { push('child[remote.account]', injectedCtx['remote.account']); } catch { /* ignore */ }
+  }
+  if (remote && remote.account) push('cached', remote.account);
+  if (candidates.length) return { api: candidates[0][1], label: candidates[0][0] };
+  return null;
+}
+
+function clientMetadata() {
+  return {
+    version: '0.2.1',
+    locale: (navigator.language || 'zh-CN'),
+    timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+  };
+}
+
+function useBalance(active) {
+  const [state, setState] = useState({ status: 'idle', normal: [], bonus: [], at: 0 });
+
+  useEffect(() => {
+    if (!active) return undefined;
+    let alive = true;
+    const load = async () => {
+      const api = remote && remote.account;
+      if (!api || typeof api.getBalance !== 'function') {
+        if (alive) setState((prev) => ({ ...prev, status: 'unavailable' }));
+        return;
+      }
+      try {
+        const result = await api.getBalance(clientMetadata());
+        if (!alive) return;
+        if (!result || !result.ok) { setState((prev) => ({ ...prev, status: 'error' })); return; }
+        const value = result.value;
+        if (!value || value.status !== 'ready') {
+          setState((prev) => ({ ...prev, status: value && value.status ? value.status : 'error' }));
+          return;
+        }
+        setState({
+          status: 'ready',
+          normal: normalizeWallets(value.value),
+          bonus: normalizeWallets(value.bonusWallets),
+          at: Date.now(),
+        });
+      } catch {
+        if (alive) setState((prev) => ({ ...prev, status: 'error' }));
+      }
+    };
+    setState((prev) => ({ ...prev, status: prev.status === 'ready' ? 'refreshing' : 'loading' }));
+    load();
+    const timer = setInterval(load, 60000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [active]);
+
+  return state;
+}
+
+/* ------------------------------------------------------------ 对话消耗金额 */
+/* 官方价目：元 / 百万 token，[谷价, 峰价]；峰谷规则见 peakStatus()。 */
+const PRICE_TABLE = {
+  flash: { hit: [0.02, 0.04], miss: [1, 2], out: [4, 8] },
+  pro: { hit: [0.15, 0.3], miss: [4.5, 9], out: [13.5, 27] },
+};
+
+const COST_STATE = { text: '', detail: '' };
+let ACTIVE_SESSION_ID = '';
+
+/** 当前会话最新的 tokenUsage 投影：面板数字分步渲染时先用它算，
+ *  行一插进去就是正确金额，不会先显示「—」再跳数。 */
+let LATEST_USAGE = null;
+function setLatestUsage(sessionId, usage) {
+  LATEST_USAGE = usage ? { id: String(sessionId || ''), usage } : null;
+}
+function sessionUsageSnapshot() {
+  if (!LATEST_USAGE) return null;
+  if (ACTIVE_SESSION_ID && LATEST_USAGE.id && LATEST_USAGE.id !== ACTIVE_SESSION_ID) return null;
+  const u = LATEST_USAGE.usage || {};
+  return {
+    uncachedInputTokens: Number(u.uncachedInputTokens || 0),
+    cacheReadTokens: Number(u.cacheReadTokens || 0),
+    cacheWriteTokens: Number(u.cacheWriteTokens || 0),
+    outputTokens: Number(u.outputTokens || 0),
+  };
+}
+
+/** 当前会话的模型 id（由状态条从 modelSelection 投影写入）。 */
+let CURRENT_MODEL_ID = '';
+
+/** 价格档：优先认投影里的模型 id；没有投影才看输入框卡片上的模型标签。
+ *  绝不再扫整页文字——整页里的 provider / prompt 会把所有会话都判成 Pro。 */
+function currentTier() {
+  const id = String(CURRENT_MODEL_ID || '');
+  if (id) return /pro/i.test(id) ? 'pro' : 'flash';
+  try {
+    const card = document.querySelector('[data-composer-card]');
+    const box = card && card.parentElement;
+    if (box && /pro/i.test(String(box.textContent || ''))) return 'pro';
+  } catch { /* ignore */ }
+  return 'flash';
+}
+
+/** 旧名保留，诊断钩子仍在用。 */
+const modelTierFromDom = currentTier;
+
+function computeCostText(usage, tier) {
+  if (!usage) return { text: '—', detail: '暂无用量' };
+  const miss = Number(usage.uncachedInputTokens || 0) + Number(usage.cacheWriteTokens || 0);
+  const hit = Number(usage.cacheReadTokens || 0);
+  const out = Number(usage.outputTokens || 0);
+  const price = PRICE_TABLE[tier] || PRICE_TABLE.flash;
+  const peak = peakStatus().peak;
+  const idx = peak ? 1 : 0;
+  const cost = (miss * price.miss[idx] + hit * price.hit[idx] + out * price.out[idx]) / 1e6;
+  const text = cost >= 0.01 ? '¥' + cost.toFixed(4) : '¥' + cost.toFixed(5);
+  const detail = [
+    tier === 'pro' ? 'Pro 价' : 'Flash 价',
+    peak ? '峰时' : '谷时',
+    '未命中 ' + miss, '缓存 ' + hit, '输出 ' + out,
+  ].join(' · ');
+  return { text, detail };
+}
+
+let costRenderer = null;
+
+const COST_ROW_LABELS = ['缓存命中', '未缓存输入', '缓存读取', '输出'];
+const COST_SAMPLE_KEY = 'dsh-plugin-whale:cost-sample';
+
+/** 面板开着时抓一份真实行的 HTML，便于关掉面板后仍能从报告里看到结构。 */
+function captureCostSample() {
+  try {
+    const all = document.querySelectorAll('body *');
+    let probe = null;
+    for (const el of all) {
+      const t = (el.textContent || '').trim();
+      if (!t.startsWith('缓存命中')) continue;
+      if (el.childElementCount > 6) continue;
+      probe = el;
+    }
+    if (!probe) return;
+    // probe 是“缓存命中”这个文本节点所在的最内层元素，它本身可能就是 dt/span；
+    // 行 = probe 的父元素（若父元素只有 1 个孩子则再上跳一层）
+    let row = probe.parentElement;
+    if (row && row.childElementCount <= 1 && row.parentElement) row = row.parentElement;
+    const container = row ? row.parentElement : null;
+    const sample = {
+      at: Date.now(),
+      labelTag: probe.tagName + '.' + String(probe.className).slice(0, 24),
+      rowTag: row ? row.tagName : '',
+      rowClass: row ? String(row.className).slice(0, 48) : '',
+      rowChildren: row ? row.childElementCount : -1,
+      rowChildTags: row ? Array.from(row.children).map((c) => c.tagName) : [],
+      rowHtml: row ? row.outerHTML.slice(0, 300) : '',
+      containerTag: container ? container.tagName : '',
+      containerClass: container ? String(container.className).slice(0, 48) : '',
+      dlCount: document.querySelectorAll('dl').length,
+      trCount: document.querySelectorAll('tr').length,
+    };
+    DIAG.costSample = sample;
+    try { window.localStorage.setItem(COST_SAMPLE_KEY, JSON.stringify(sample)); } catch { /* ignore */ }
+  } catch { /* ignore */ }
+}
+
+/** 抓真实行结构只为排查用：常开等于每次扫描后再全量扫一遍 body。 */
+const DEBUG_COST_SAMPLE = false;
+let lastSampleAt = 0;
+function maybeCaptureCostSample() {
+  if (!DEBUG_COST_SAMPLE) return;
+  if (Date.now() - lastSampleAt < 60000) return;
+  lastSampleAt = Date.now();
+  captureCostSample();
+}
+
+/** 从面板里读出三个 token 数字（未缓存输入 / 缓存读取 / 输出）。
+ *  做法：找「文本恰好等于标签」的叶子元素，再取它的下一个兄弟（dt→dd / span→span 都适用）。 */
+const USAGE_LABELS = {
+  miss: ['未缓存输入', '未命中输入', '未缓存'],
+  hit: ['缓存读取', '缓存读'],
+  out: ['输出'],
+};
+
+function readUsageValue(el) {
+  const digits = (node) => {
+    const n = Number(String((node && node.textContent) || '').replace(/[^\d.]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  };
+  // 1) 下一个兄弟元素就是数值
+  let n = digits(el.nextElementSibling);
+  if (n !== null) return n;
+  // 2) 父元素的下一个兄弟（行被包了一层时）
+  const parent = el.parentElement;
+  if (parent) {
+    n = digits(parent.nextElementSibling);
+    if (n !== null) return n;
+    // 3) 父元素文本里去掉标签后剩下的数字
+    const own = String(parent.textContent || '').replace(String(el.textContent || ''), '');
+    n = digits({ textContent: own });
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+function parsePanelUsage(rootEl) {
+  const norm = (t) => String(t || '').replace(/[\s:：]/g, '');
+  const leaves = [];
+  const scopeEl = rootEl && rootEl.querySelectorAll ? rootEl : document;
+  for (const el of scopeEl.querySelectorAll('*')) {
+    if (el.childElementCount !== 0) continue;
+    const t = norm(el.textContent);
+    if (!t || t.length > 8) continue;
+    if (Object.values(USAGE_LABELS).some((list) => list.includes(t))) leaves.push({ el, label: t });
+  }
+  if (!leaves.length) { DIAG.costLabels = 'none'; return null; }
+
+  DIAG.costLabels = leaves.map((l) => l.label).join('|').slice(0, 60);
+  const pick = (list) => {
+    const hit = leaves.find((l) => list.includes(l.label));
+    return hit ? readUsageValue(hit.el) : null;
+  };
+
+  let miss = pick(USAGE_LABELS.miss);
+  let hit = pick(USAGE_LABELS.hit);
+  let out = pick(USAGE_LABELS.out);
+
+  if (miss === null || hit === null || out === null) {
+    // 顺序兜底：这些叶子按出现顺序就是 未缓存输入 / 缓存读取 / 输出
+    const ordered = leaves.filter((l) => ['未缓存输入', '未命中输入', '未缓存', '缓存读取', '缓存读', '输出'].includes(l.label));
+    const vals = ordered.map((l) => readUsageValue(l.el)).filter((v) => v !== null);
+    if (vals.length >= 3) { miss = vals[0]; hit = vals[1]; out = vals[2]; }
+  }
+
+  DIAG.costParsed = [miss, hit, out];
+  if (miss === null || hit === null || out === null) return null;
+  return { uncachedInputTokens: miss, cacheReadTokens: hit, cacheWriteTokens: 0, outputTokens: out };
+}
+
+/** 按“行特征”找用量行：2–4 个子元素，其中一个文本等于已知标签、另一个含数字。 */
+function findUsageRows() {
+  const rows = [];
+  const nodes = document.querySelectorAll('div, li, tr, dl > div');
+  for (const el of nodes) {
+    if (el.hasAttribute('data-whale-cost')) continue;
+    if (el.childElementCount < 2 || el.childElementCount > 4) continue;
+    const kids = Array.from(el.children);
+    const labelIndex = kids.findIndex((k) => COST_ROW_LABELS.includes((k.textContent || '').trim()));
+    if (labelIndex < 0) continue;
+    const valueIndex = kids.findIndex((k, i) => i !== labelIndex && /\d/.test(k.textContent || ''));
+    if (valueIndex < 0) continue;
+    rows.push({ el, label: (kids[labelIndex].textContent || '').trim(), labelIndex, valueIndex });
+  }
+  return rows;
+}
+
+/** 扁平结构：<dl> 的直接子元素就是 dt/dd 交替出现。 */
+function findFlatUsageDL() {
+  const dls = document.querySelectorAll('dl');
+  for (const dl of dls) {
+    const kids = Array.from(dl.children);
+    const hasLabel = kids.some((k) => COST_ROW_LABELS.includes((k.textContent || '').trim()));
+    const hasValue = kids.some((k) => /\d/.test(k.textContent || ''));
+    if (hasLabel && hasValue) return dl;
+  }
+  return null;
+}
+
+/** 扁平 dl 模式下的插入：克隆「输出」的 dt+dd 一对，追加到末尾。 */
+function insertFlatCostRow(dl, text, lines) {
+  if (dl.querySelector('[data-whale-cost]')) return 'ok';
+  const kids = Array.from(dl.children);
+  const outIndex = kids.findIndex((k) => (k.textContent || '').trim() === '输出');
+  const labelIndex = outIndex >= 0 ? outIndex : kids.findIndex(
+    (k) => COST_ROW_LABELS.includes((k.textContent || '').trim()),
+  );
+  if (labelIndex < 0) return 'no-source';
+  const labelEl = kids[labelIndex];
+  const valueEl = kids[labelIndex + 1];
+  if (!valueEl || !/\d/.test(valueEl.textContent || '')) return 'no-parts:' + labelEl.outerHTML.slice(0, 90);
+
+  const dt = labelEl.cloneNode(true);
+  const dd = valueEl.cloneNode(true);
+  dt.textContent = '消耗金额';
+  dd.textContent = text || '—';
+  try { dd.setAttribute('data-whale-detail', JSON.stringify(lines || [])); } catch { /* ignore */ }
+  dt.setAttribute('data-whale-cost', '1');
+  dd.setAttribute('data-whale-cost-value', '1');
+  dl.appendChild(dt);
+  dl.appendChild(dd);
+  return 'ok';
+}
+
+/** 「消耗金额」的悬停卡片。
+ *  原生 title 在 React 反复重绘时会"时好时不好"；普通 fixed + z-index 又压不过宿主的浮层/
+ *  top-layer，所以改用 Popover API：卡片进浏览器顶层，永远在最上面。 */
+function installCostTip() {
+  if (document.querySelector('[data-whale-cost-tip]')) return;
+  const tip = document.createElement('div');
+  tip.setAttribute('data-whale-cost-tip', '1');
+  tip.setAttribute('role', 'tooltip');
+  const usePopover = typeof tip.showPopover === 'function';
+  if (usePopover) tip.setAttribute('popover', 'manual');
+  tip.style.cssText = 'position:fixed;left:0;top:0;margin:0;max-width:430px;padding:8px 10px;'
+    + 'border-radius:10px;font-size:11px;line-height:16px;white-space:pre;pointer-events:none;'
+    + 'background:rgba(252,253,255,.97);'
+    + 'background:color-mix(in srgb, var(--dsw-alias-bg-overlay,#ffffff) 96%, transparent);'
+    + 'border:1px solid var(--dsw-alias-border-l1,rgba(140,150,170,.35));'
+    + 'color:var(--dsw-alias-label-secondary,#5c6270);font-variant-numeric:tabular-nums;'
+    + 'box-shadow:0 12px 30px -14px rgba(15,20,32,.45);';
+  if (!usePopover) tip.style.display = 'none';
+  document.body.appendChild(tip);
+
+  let current = null;
+  let hideTimer = 0;
+  let watchTimer = 0;
+
+  const visible = () => (usePopover ? tip.matches(':popover-open') : tip.style.display === 'block');
+
+  const hide = () => {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = 0; }
+    if (watchTimer) { clearInterval(watchTimer); watchTimer = 0; }
+    current = null;
+    if (usePopover) {
+      try { tip.hidePopover(); } catch { /* ignore */ }
+    } else {
+      tip.style.display = 'none';
+    }
+  };
+
+  const show = (el) => {
+    let lines = null;
+    try { lines = JSON.parse(el.getAttribute('data-whale-detail') || 'null'); } catch { lines = null; }
+    if (!Array.isArray(lines) || !lines.length) { hide(); return; }
+    current = el;
+    tip.textContent = lines.join('\n');
+    if (usePopover) {
+      try { tip.showPopover(); } catch { tip.style.display = 'block'; }
+    } else {
+      tip.style.display = 'block';
+    }
+    const rect = el.getBoundingClientRect();
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+    let top = rect.top - height - 8;
+    if (top < 8) top = Math.min(window.innerHeight - height - 8, rect.bottom + 8);
+    tip.style.left = Math.round(left) + 'px';
+    tip.style.top = Math.round(top) + 'px';
+    if (!watchTimer) {
+      watchTimer = setInterval(() => {
+        if (!visible()) return;
+        if (!current || !current.isConnected) hide();
+      }, 400);
+    }
+  };
+
+  // 整行都能触发：数值格或标签格，悬停哪个都弹
+  const anchorOf = (ev) => {
+    const node = ev.target;
+    if (!node || !node.closest) return null;
+    const hit = node.closest('[data-whale-cost-value]') || node.closest('[data-whale-cost]');
+    if (!hit || !hit.isConnected) return null;
+    const row = hit.parentElement;
+    const value = row && row.querySelector ? row.querySelector('[data-whale-cost-value]') : null;
+    return value && value.isConnected ? value : hit;
+  };
+
+  document.addEventListener('mouseover', (ev) => {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = 0; }
+    const el = anchorOf(ev);
+    if (!el) return;
+    if (el === current && visible()) return;
+    show(el);
+  });
+  document.addEventListener('mouseout', (ev) => {
+    if (!anchorOf(ev)) return;
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(hide, 140);
+  });
+  // 点击兜底：悬停不可靠时，点一下金额也能把卡片叫出来（再点收起）
+  document.addEventListener('click', (ev) => {
+    const el = anchorOf(ev);
+    if (!el) return;
+    if (el === current && visible()) { hide(); return; }
+    show(el);
+  });
+  window.addEventListener('scroll', hide, true);
+  window.addEventListener('resize', hide);
+}
+
+/** 把「消耗金额」行插进用量面板（面板没有插槽，只能 DOM 注入）。 */
+function installCostRow() {
+  if (window.__dshWhaleCostInstalled) return () => {};
+  window.__dshWhaleCostInstalled = true;
+  let dispose = () => { window.__dshWhaleCostInstalled = false; };
+
+  /** 用面板自身的数字算金额；读不到就显示「—」，绝不拿别的会话的数顶替。
+   *  计价按「会话账本」里的峰/谷分桶累加，未观测到的余量才按当前时段计价。 */
+  const costFor = (scopeEl) => {
+    // 面板数字通常分步渲染：先用会话投影顶上，面板读到真值后再覆盖
+    let parsed = parsePanelUsage(scopeEl);
+    let source = 'panel';
+    if (!parsed) {
+      parsed = sessionUsageSnapshot();
+      source = 'projection';
+    }
+    if (!parsed) {
+      return { parsed: null, source: 'none', text: '—', detail: '读取面板用量中…', lines: ['—', '读取面板用量中…'] };
+    }
+    if (ACTIVE_SESSION_ID) {
+      try { recordSessionUsage(ACTIVE_SESSION_ID, parsed); } catch { /* ignore */ }
+    }
+    const totals = {
+      miss: parsed.uncachedInputTokens + parsed.cacheWriteTokens,
+      hit: parsed.cacheReadTokens,
+      out: parsed.outputTokens,
+    };
+    const split = ACTIVE_SESSION_ID ? sessionCost(ACTIVE_SESSION_ID, totals) : null;
+    if (!split) {
+      const info = computeCostText(parsed, currentTier());
+      return { parsed, source, text: info.text, detail: info.detail, lines: [info.text, info.detail] };
+    }
+
+    const fmt = (n) => (n >= 0.01 ? n.toFixed(4) : n.toFixed(5));
+    const num = (n) => Number(n || 0).toLocaleString('en-US');
+    const price = PRICE_TABLE[currentTier()] || PRICE_TABLE.flash;
+    const peakNow = peakStatus().peak;
+    const totalTok = totals.miss + totals.hit + totals.out;
+    const lines = ['¥' + fmt(split.cost), (currentTier() === 'pro' ? 'Pro 价' : 'Flash 价') + ' · ' + (peakNow ? '峰时' : '谷时')];
+    const addBucket = (label, bucket, amount, note) => {
+      const tok = Number(bucket.miss || 0) + Number(bucket.hit || 0) + Number(bucket.out || 0);
+      if (!tok) return;
+      lines.push(label + '  ' + fmt(amount) + ' 元 · ' + num(tok) + ' tok' + (note || ''));
+      lines.push('      未缓存 ' + num(bucket.miss) + ' · 缓存 ' + num(bucket.hit) + ' · 输出 ' + num(bucket.out));
+    };
+    addBucket('历史', split.buckets.history, split.historyCost, '（按谷价估）');
+    addBucket('谷时', split.buckets.valley, split.valleyCost, '');
+    addBucket('峰时', split.buckets.peak, split.peakCost, '');
+    if (split.restTokens > 0) {
+      lines.push('未观测  ' + fmt(split.restCost) + ' 元 · ' + num(split.restTokens) + ' tok（按当前时段估）');
+    }
+    lines.push('合计    ' + num(totalTok) + ' tok');
+    lines.push('单价 元/百万：谷 未缓存 ' + price.miss[0] + ' · 缓存 ' + price.hit[0] + ' · 输出 ' + price.out[0]);
+    lines.push('              峰 未缓存 ' + price.miss[1] + ' · 缓存 ' + price.hit[1] + ' · 输出 ' + price.out[1]);
+    lines.push('金额为本机按价目估算，非平台账单 · v' + PLUGIN_VERSION);
+    return { parsed, source, text: '¥' + fmt(split.cost), detail: lines.slice(1, -1).join(' · '), lines };
+  };
+
+  const render = () => {
+    // 路径 A：扁平 <dl>（dt/dd 直接挂在 dl 下）
+    const flat = findFlatUsageDL();
+    if (flat) {
+      DIAG.costPanel = 'flat-dl(' + flat.childElementCount + ')';
+      const info = costFor(flat);
+      DIAG.costSource = info.source;
+      let dd = flat.querySelector('[data-whale-cost-value]');
+      if (!dd) {
+        const result = insertFlatCostRow(flat, info.text, info.lines);
+        DIAG.costRow = result;
+        dd = flat.querySelector('[data-whale-cost-value]');
+      }
+      if (dd) {
+        if (dd.textContent !== info.text) dd.textContent = info.text;
+        try { dd.setAttribute('data-whale-detail', JSON.stringify(info.lines || [])); } catch { /* ignore */ }
+      }
+      DIAG.costRow = 'ok';
+      readyOnce = true;
+      return;
+    }
+
+    const rows = findUsageRows();
+    DIAG.costPanel = rows.length ? String(rows.length) + '-rows' : 'none';
+    if (!rows.length) {
+      DIAG.costRow = 'no-source';
+      maybeCaptureCostSample();
+      return;
+    }
+
+    // 只认「当前这个面板」里的行，避免更新到别的会话残留的节点
+    const container = rows[0].el.parentElement;
+    const info = costFor(container);
+    DIAG.costSource = info.source;
+    let row = container ? container.querySelector('[data-whale-cost]') : null;
+
+    if (!row) {
+      const sample = rows.find((r) => r.label === '输出') || rows[rows.length - 1];
+      if (!sample || !sample.el.parentElement) { DIAG.costRow = 'no-parent'; return; }
+      row = sample.el.cloneNode(true);
+      row.setAttribute('data-whale-cost', '1');
+      const label = row.children[sample.labelIndex];
+      const value = row.children[sample.valueIndex];
+      if (!label || !value) { DIAG.costRow = 'no-parts:' + row.outerHTML.slice(0, 120); return; }
+      label.textContent = '消耗金额';
+      value.setAttribute('data-whale-cost-value', '1');
+      value.textContent = info.text;
+      try { value.setAttribute('data-whale-detail', JSON.stringify(info.lines || [])); } catch { /* ignore */ }
+      sample.el.parentElement.insertBefore(row, sample.el.nextSibling);
+      try {
+        const gap = sample.el.getBoundingClientRect().height;
+        if (gap > 0) row.style.marginTop = (-gap * 0.1).toFixed(1) + 'px';
+      } catch { /* ignore */ }
+    } else {
+      const value = row.querySelector('[data-whale-cost-value]') || row;
+      if (value.textContent !== info.text) value.textContent = info.text;
+      try { value.setAttribute('data-whale-detail', JSON.stringify(info.lines || [])); } catch { /* ignore */ }
+    }
+
+    DIAG.costRow = 'ok';
+    readyOnce = true;
+    try { window.localStorage.removeItem(COST_SAMPLE_KEY); } catch { /* ignore */ }
+  };
+
+  // 面板刚出现时数字可能还没渲染完：只有「第一次找到行」才补两次刷新；
+  // 行已存在时每次更新只重画文本，不再全文档扫描。
+  let readyOnce = false;
+  const renderSoon = () => {
+    const wasReady = readyOnce;
+    render();
+    if (!wasReady && readyOnce) {
+      setTimeout(render, 300);
+      setTimeout(render, 900);
+    }
+  };
+
+  costRenderer = renderSoon;
+  try {
+    // 只对「新增子树里可能藏着用量面板」做出反应：
+    // 面板一出现就在同一帧补行（不再先白一版再跳出），
+    // 流式输出往别处刷 DOM 时既不扫描也不排队。
+    let rafId = 0;
+    const flushOnce = () => {
+      observer.disconnect();
+      try { render(); } finally {
+        try { observer.observe(document.body, { childList: true, subtree: true }); } catch { /* ignore */ }
+      }
+    };
+    const flush = () => {
+      rafId = 0;
+      flushOnce();
+      if (!readyOnce) {
+        // 面板可能还在逐行渲染（行有了、数字还没到）：短时间内补两次，命中就停
+        retries.push(setTimeout(() => { if (!readyOnce) flushOnce(); }, 120));
+        retries.push(setTimeout(() => { if (!readyOnce) flushOnce(); }, 320));
+      }
+    };
+    const looksLikePanel = (node) => {
+      if (!node || node.nodeType !== 1) return false;
+      try {
+        if (node.matches && node.matches('dl')) return true;
+        if (node.querySelector && node.querySelector('dl')) return true;
+        const text = node.textContent || '';
+        return text.indexOf('缓存命中') >= 0 || text.indexOf('缓存读取') >= 0
+          || text.indexOf('未缓存输入') >= 0;
+      } catch { return false; }
+    };
+    const isOurRow = (node) => {
+      if (!node || node.nodeType !== 1) return false;
+      try {
+        if (node.matches && node.matches('[data-whale-cost]')) return true;
+        return !!(node.querySelector && node.querySelector('[data-whale-cost]'));
+      } catch { return false; }
+    };
+    let lastMissAt = 0;
+    const retries = [];
+    const observer = new MutationObserver((records) => {
+      let hit = false;
+      for (const record of records) {
+        for (const node of record.removedNodes) {
+          if (isOurRow(node)) readyOnce = false;   // 面板关掉：下次打开重新走快路径
+        }
+        if (hit) continue;
+        for (const node of record.addedNodes) {
+          if (looksLikePanel(node)) { hit = true; break; }
+        }
+      }
+      if (!hit) {
+        // 兜底：万一面板不是以「新增子树」的方式出现，未就绪时每秒最多探一次
+        if (readyOnce) return;
+        const now = Date.now();
+        if (now - lastMissAt < 1200) return;
+        lastMissAt = now;
+      }
+      if (rafId) return;
+      rafId = requestAnimationFrame(flush);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    installCostTip();
+    render();
+    dispose = () => {
+      try { observer.disconnect(); } catch { /* ignore */ }
+      if (rafId) { try { cancelAnimationFrame(rafId); } catch { /* ignore */ } }
+      retries.forEach((id) => clearTimeout(id));
+      const tip = document.querySelector('[data-whale-cost-tip]');
+      if (tip) tip.remove();
+      document.querySelectorAll('[data-whale-cost], [data-whale-cost-value]').forEach((n) => n.remove());
+      window.__dshWhaleCostInstalled = false;
+    };
+  } catch { /* ignore */ }
+  return dispose;
+}
+
+/* ------------------------------------------------------------ 今日消耗累计 */
+/* 口径：按 token 增量 × 当前时段单价累加（不做余额差值），按北京日期分桶。 */
+const COST_DAYS_KEY = 'dsh-plugin-whale:cost-days';
+const COST_STORE_VERSION = 4;   // 4 = 历史单独成桶（标注首次观测时段），此后按峰/谷分桶
+const costStore = (() => {
+  try {
+    const raw = window.localStorage.getItem(COST_DAYS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && parsed.v === COST_STORE_VERSION && parsed.days && parsed.last && parsed.buckets) return parsed;
+  } catch { /* ignore */ }
+  return { v: COST_STORE_VERSION, days: {}, last: {}, buckets: {} };
+})();
+
+function saveCostStore() {
+  try { window.localStorage.setItem(COST_DAYS_KEY, JSON.stringify(costStore)); } catch { /* ignore */ }
+}
+
+/** 记录一次会话用量快照：只累加比上次多出来的 token，按此刻峰谷单价计价。 */
+function todayCost() {
+  return costStore.days[beijingParts().date] || 0;
+}
+
+// 首次见到某会话时，用量超过这个量级就认为是"历史存量"（插件开始记录之前的）
+const HISTORY_MIN_TOKENS = 100000;
+
+function blankSessionBuckets() {
+  // cost = 记账当时按"那一刻的档位 + 峰谷"算好的金额；
+  // 只存 token 会在切模型时把整段历史按新价重算（v1.0.0 的缺陷）。
+  return {
+    peak: { miss: 0, hit: 0, out: 0, cost: 0, tier: '' },
+    valley: { miss: 0, hit: 0, out: 0, cost: 0, tier: '' },
+    history: { miss: 0, hit: 0, out: 0, cost: 0, tier: '', peak: false },
+  };
+}
+
+/** 一次增量在给定档位/峰谷下的金额（元）。 */
+function priceTokens(t, idx) {
+  const price = PRICE_TABLE[currentTier()] || PRICE_TABLE.flash;
+  return (Number(t.miss || 0) * price.miss[idx]
+    + Number(t.hit || 0) * price.hit[idx]
+    + Number(t.out || 0) * price.out[idx]) / 1e6;
+}
+
+function recordSessionUsage(sessionId, usage) {
+  if (!usage) return;
+  const id = String(sessionId || 'active');
+  const seen = costStore.last[id];
+  const prev = seen || { miss: 0, hit: 0, out: 0 };
+  const raw = {
+    miss: Number(usage.uncachedInputTokens || 0) + Number(usage.cacheWriteTokens || 0),
+    hit: Number(usage.cacheReadTokens || 0),
+    out: Number(usage.outputTokens || 0),
+  };
+  // 单调取大：面板解析出的数字可能比投影略小，不能把基线往回拉（否则会重复计数）
+  const cur = {
+    miss: Math.max(prev.miss, raw.miss),
+    hit: Math.max(prev.hit, raw.hit),
+    out: Math.max(prev.out, raw.out),
+  };
+  const dMiss = cur.miss - prev.miss;
+  const dHit = cur.hit - prev.hit;
+  const dOut = cur.out - prev.out;
+  costStore.last[id] = cur;
+
+  const buckets = costStore.buckets[id] || (costStore.buckets[id] = blankSessionBuckets());
+  const isPeakNow = peakStatus().peak;
+
+  // 第一次见到这个会话时区分两种情况：
+  //   a) 存量很大 → 是"插件开始记录之前"的历史，单独成桶，且不计入今日；
+  //   b) 存量很小（比如刚开的新对话第一轮）→ 属于新产生的用量，正常计入今日与峰/谷桶。
+  const firstTotal = cur.miss + cur.hit + cur.out;
+  if (!seen && firstTotal >= HISTORY_MIN_TOKENS) {
+    buckets.history.miss += cur.miss;
+    buckets.history.hit += cur.hit;
+    buckets.history.out += cur.out;
+    // 历史股的真实时段不可追溯，统一按谷价记账（与 tooltip 口径一致）
+    buckets.history.cost = (Number(buckets.history.cost) || 0) + priceTokens(cur, 0);
+    buckets.history.tier = buckets.history.tier || currentTier();
+    buckets.history.peak = isPeakNow;
+    saveCostStore();
+    notifyUsageChanged();
+    return;
+  }
+  if (!dMiss && !dHit && !dOut) return;
+
+  // 此后的增量严格按**当时**的档位与峰/谷分桶
+  const key = isPeakNow ? 'peak' : 'valley';
+  buckets[key].miss += dMiss;
+  buckets[key].hit += dHit;
+  buckets[key].out += dOut;
+
+  const idx = isPeakNow ? 1 : 0;
+  const delta = priceTokens({ miss: dMiss, hit: dHit, out: dOut }, idx);
+  buckets[key].cost = (Number(buckets[key].cost) || 0) + delta;
+  if (!buckets[key].tier) buckets[key].tier = currentTier();
+  const day = beijingParts().date;
+  costStore.days[day] = (costStore.days[day] || 0) + delta;
+  const keys = Object.keys(costStore.days).sort();
+  while (keys.length > 30) delete costStore.days[keys.shift()];
+  saveCostStore();
+  notifyUsageChanged();
+}
+
+function sessionCost(sessionId, totals) {
+  const tokensOf = (t) => t.miss + t.hit + t.out;
+  // 金额一律用「桶里的 token × 该桶档位/峰谷的单价」现场算。
+  // 早期版本把金额累加进账本，某几类 token 没被记那次就永远缺失（实测输出项整段丢失），
+  // 所以账本只当"令牌桶"，金额永远可重算、可核对。
+  const tierOf = (bucket) => {
+    const tier = bucket && bucket.tier;
+    return tier === 'pro' || tier === 'flash' ? tier : currentTier();
+  };
+  const priced = (bucket, idx) => {
+    const price = PRICE_TABLE[tierOf(bucket)] || PRICE_TABLE.flash;
+    return (Number(bucket.miss || 0) * price.miss[idx]
+      + Number(bucket.hit || 0) * price.hit[idx]
+      + Number(bucket.out || 0) * price.out[idx]) / 1e6;
+  };
+
+  const b = costStore.buckets[String(sessionId || '')];
+  if (!b) return null;
+  const history = b.history || { miss: 0, hit: 0, out: 0, tier: '', peak: false };
+
+  const historyCost = priced(history, 0);
+  const peakCost = priced(b.peak, 1);
+  const valleyCost = priced(b.valley, 0);
+
+  const seenMiss = history.miss + b.peak.miss + b.valley.miss;
+  const seenHit = history.hit + b.peak.hit + b.valley.hit;
+  const seenOut = history.out + b.peak.out + b.valley.out;
+  const restMiss = Math.max(0, Number(totals.miss || 0) - seenMiss);
+  const restHit = Math.max(0, Number(totals.hit || 0) - seenHit);
+  const restOut = Math.max(0, Number(totals.out || 0) - seenOut);
+  const restCost = priceTokens({ miss: restMiss, hit: restHit, out: restOut }, peakStatus().peak ? 1 : 0);
+
+  return {
+    cost: historyCost + peakCost + valleyCost + restCost,
+    buckets: { history, peak: b.peak, valley: b.valley },
+    tiers: { history: tierOf(history), peak: tierOf(b.peak), valley: tierOf(b.valley) },
+    historyCost, historyTokens: tokensOf(history), historyPeak: !!history.peak,
+    peakCost, peakTokens: tokensOf(b.peak),
+    valleyCost, valleyTokens: tokensOf(b.valley),
+    restCost, restTokens: restMiss + restHit + restOut,
+  };
+}
+
+/** 重置账本：清空会话分桶、基线与今日累计。 */
+function resetCostStore() {
+  costStore.days = {};
+  costStore.last = {};
+  costStore.buckets = {};
+  saveCostStore();
+  try { window.localStorage.removeItem(COST_DAYS_KEY); } catch { /* ignore */ }
+  try { applyToneAll(); } catch { /* ignore */ }
+}
+
+/** 供状态条组件调用：更新可用于展示的消耗文本。 */
+function updateCostState(usage) {
+  const tier = modelTierFromDom();
+  const { text, detail } = computeCostText(usage, tier);
+  COST_STATE.text = text;
+  COST_STATE.detail = detail;
+  if (costRenderer) { try { costRenderer(); } catch { /* ignore */ } }
+  DIAG.cost = text + ' (' + detail + ')';
+}
+
+/* ---------------------------------------------------- 1 号位：余额按钮 */
+/* 故意用原生 DOM 实现、挂到 body 上：放进 React 插槽里时，任何一次重渲染/
+ * 插槽重挂载都会连带卸载它（表现为“点开之后图标和弹层一起消失”）。 */
+
+const BALANCE_ATTR = 'data-dsh-whale-balance';
+
+function iconMarkup(name, size) {
+  const icon = ICONS[name] || ICONS.granary;
+  const main = icon.main.map((d) => `<path d="${d}"/>`).join('');
+  const fine = icon.fine.map((d) => `<path d="${d}"/>`).join('');
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" `
+    + `stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+    + `<g stroke-width="1.6">${main}</g><g stroke-width="1.1">${fine}</g></svg>`;
+}
+
+/* 鱼刺图标：24×24 线稿，头 > 尾 > 三对肋刺依次减小，眼睛在中轴线上方。 */
+const FISH_BONE_PATHS = [
+  'M6.2 12H17.6',
+  'M17.6 8.2V15.8',
+  'M17.6 8.2c2.4 1 4.2 2.4 5.4 3.8-1.2 1.4-3 2.8-5.4 3.8',
+  'M6.2 12 2.6 8.4M6.2 12l-3.6 3.6',
+  'M14.6 12 13.2 8.5M14.6 12l-1.4 3.5',
+  'M11.6 12 10.3 8.9M11.6 12l-1.3 3.1',
+  'M8.8 12 7.6 9.2M8.8 12l-1.2 2.8',
+];
+
+function fishBoneMarkup(size) {
+  return '<svg viewBox="0 0 24 24" width="' + size + '" height="' + size + '" fill="none" '
+    + 'stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + FISH_BONE_PATHS.map((d) => '<path d="' + d + '" stroke-width="1.6"/>').join('')
+    + '<circle cx="20.4" cy="11" r="0.85" fill="currentColor" stroke="none"/></svg>';
+}
+
+/* 卡片里的鲸鱼开关：线稿层 + 从头部揭开的蓝色填充层。 */
+function whaleCardSvg() {
+  const body = bodyByAngle(0);
+  const d = STATIC_D;
+  const fill = '<path d="' + body + '" fill="currentColor"/>'
+    + '<path d="' + d + '" fill-rule="evenodd" style="fill:var(--dsw-alias-bg-overlay,#ffffff)"/>';
+  return '<svg viewBox="0 0 150 110" width="100%" height="100%" aria-hidden="true" '
+    + 'style="display:block;overflow:visible">'
+    + '<defs><clipPath id="dsh-whale-card-clip">'
+    + '<rect id="dsh-whale-card-reveal" x="0" y="0" width="0" height="110"/></clipPath></defs>'
+    + '<g transform="rotate(-8 74.8 54.3)">'
+    + '<g clip-path="url(#dsh-whale-card-clip)">' + fill + '</g>'
+    + '<path d="' + body + '" fill="none" stroke="currentColor" stroke-width="5" '
+    + 'stroke-linejoin="round" stroke-linecap="round"/>'
+    + '<path d="' + d + '" fill="none" stroke="currentColor" stroke-width="5" '
+    + 'stroke-linejoin="round" stroke-linecap="round"/>'
+    + '</g></svg>';
+}
+
+let cardWhaleAnim = 0;
+function animateCardWhale(on, animate) {
+  const rect = document.getElementById('dsh-whale-card-reveal');
+  if (!rect) return;
+  const from = parseFloat(rect.getAttribute('width')) || 0;
+  const to = on ? 150 : 0;
+  cancelAnimationFrame(cardWhaleAnim);
+  if (!animate) { rect.setAttribute('width', String(to)); return; }
+  const t0 = performance.now();
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / 520);
+    const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+    rect.setAttribute('width', (from + (to - from) * e).toFixed(2));
+    if (k < 1) cardWhaleAnim = requestAnimationFrame(step);
+  };
+  cardWhaleAnim = requestAnimationFrame(step);
+}
+
+/* 弹层里的「统计 + 鲸鱼开关」一行。 */
+function playRowMarkup() {
+  const chip = (icon, key) => '<span style="display:flex;align-items:center;gap:3px;padding:2px 6px;border-radius:999px;'
+    + 'background:color-mix(in srgb, var(--dsw-alias-state-business-primary,#4D6BFE) 8%, transparent);'
+    + 'color:var(--dsw-alias-state-business-primary,#4D6BFE)">' + icon
+    + '<b data-count-' + key + ' style="font-size:11.5px;font-weight:600;'
+    + 'color:var(--dsw-alias-label-primary,#1b1f26);font-variant-numeric:tabular-nums">0</b></span>';
+  return '<div style="display:flex;align-items:center;gap:6px;margin:6px 3px 2px;'
+    + 'padding:6px 6px 6px 10px;border-top:1px dashed var(--dsw-alias-border-l1, rgba(140,150,170,.35))">'
+    + '<span data-play-label style="font-size:10.5px;color:var(--dsw-alias-label-caption,#b3b9c4);'
+    + 'white-space:nowrap">最高纪录</span>'
+    + chip(iconMarkup('bowl-spent', 15), 'bowl')
+    + chip(fishBoneMarkup(15), 'fish')
+    + '<button type="button" data-whale-toggle aria-label="消遣模式" title="开启消遣模式" '
+    + 'style="flex:none;width:36px;height:36px;padding:3px;margin-left:auto;border:none;border-radius:10px;'
+    + 'background:transparent;cursor:pointer;color:var(--dsw-alias-state-business-primary,#4D6BFE);'
+    + 'display:flex;align-items:center;justify-content:center">'
+    + whaleCardSvg() + '</button></div>';
+}
+
+let balanceState = { status: 'idle', normal: [], bonus: [], at: 0 };
+// 余额的唯一真相：设置页与粮仓弹层都订阅它，任一边刷新两边同时变
+const balanceListeners = new Set();
+function setBalance(next) {
+  balanceState = next;
+  balanceListeners.forEach((fn) => { try { fn(balanceState); } catch { /* ignore */ } });
+}
+function subscribeBalance(fn) { balanceListeners.add(fn); return () => balanceListeners.delete(fn); }
+function getBalanceSnapshot() { return balanceState; }
+
+const LAST_KEY = 'dsh-plugin-whale:last-balance';
+
+function readLastBalance() {
+  try {
+    const raw = window.localStorage.getItem(LAST_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.normal)) return null;
+    if (!Number.isFinite(parsed.at) || Date.now() - parsed.at > 24 * 3600 * 1000) return null;
+    return parsed;
+  } catch { return null; }
+}
+
+function writeLastBalance() {
+  try {
+    window.localStorage.setItem(LAST_KEY, JSON.stringify({
+      normal: balanceState.normal, bonus: balanceState.bonus, at: Date.now(),
+    }));
+  } catch { /* ignore */ }
+}
+
+let fetchInFlight = null;
+/** 同一时刻只允许一个取数请求，两个视图同时刷新时不会打架。 */
+function fetchBalance() {
+  if (!fetchInFlight) {
+    fetchInFlight = doFetchBalance().finally(() => { fetchInFlight = null; });
+  }
+  return fetchInFlight;
+}
+
+async function doFetchBalance() {
+  const found = accountApi();
+  const api = found && found.api;
+  if (!api) {
+    setBalance({ ...balanceState, status: 'unavailable' });
+    DIAG.balance = 'noGetBalance';
+    DIAG.raw = 'seen: ' + (DIAG.seen || 'none');
+    return balanceState;
+  }
+  if (balanceState.status !== 'ready') setBalance({ ...balanceState, status: 'loading' });
+  DIAG.balance = 'loading';
+  try {
+    DIAG.path = found.label;
+    const result = await api.getBalance(clientMetadata());
+    if (!result || !result.ok) {
+      setBalance({ ...balanceState, status: 'error' });
+      DIAG.balance = 'error' + (result && result.error && result.error.message
+        ? ':' + String(result.error.message).slice(0, 24) : '');
+      return balanceState;
+    }
+    const value = result.value;
+    try {
+      DIAG.raw = JSON.stringify(value).slice(0, 180);
+    } catch { DIAG.raw = 'unserializable'; }
+    if (!value || value.status !== 'ready') {
+      setBalance({ ...balanceState, status: (value && value.status) || 'error' });
+      DIAG.balance = 'status:' + balanceState.status;
+      return balanceState;
+    }
+    const bonus = normalizeWallets(value.bonusWallets);
+    setBalance({
+      status: 'ready',
+      normal: normalizeWallets(value.value),
+      bonus,
+      at: Date.now(),
+    });
+    DIAG.balance = 'ready ' + balanceState.normal.length + '/' + balanceState.bonus.length;
+    writeLastBalance();
+  } catch (error) {
+    setBalance({ ...balanceState, status: 'error' });
+    DIAG.balance = 'throw:' + String((error && error.message) || error).slice(0, 24);
+  }
+  return balanceState;
+}
+
+/** 汇总一段可复制的诊断文本（弹层里“复制诊断”按钮用）。 */
+function buildReport() {
+  const lines = ['dsh-plugin-whale 诊断报告', 'time: ' + new Date().toISOString()];
+  lines.push('diag: ' + JSON.stringify(DIAG));
+  try {
+    const ctx = clientCtx || {};
+    lines.push('has ctx: ' + !!clientCtx);
+    lines.push('typeof ctx.get: ' + (typeof ctx.get));
+    lines.push('typeof ctx.remote: ' + (typeof ctx.remote));
+    lines.push('typeof ctx[remote.account]: ' + (typeof ctx['remote.account']));
+    const live = ctx.remote || null;
+    lines.push('ctx.remote keys: ' + (live ? Object.keys(live).join(',') : 'null'));
+    let fromGet = 'no-get';
+    if (typeof ctx.get === 'function') {
+      try { fromGet = ctx.get('remote'); } catch (error) { fromGet = 'throw:' + (error && error.message); }
+    }
+    lines.push('ctx.get(remote) keys: ' + (fromGet && typeof fromGet === 'object'
+      ? Object.keys(fromGet).join(',') : String(fromGet)));
+    lines.push('cached remote keys: ' + (remote ? Object.keys(remote).join(',') : 'null'));
+  } catch (error) {
+    lines.push('probe error: ' + String((error && error.message) || error));
+  }
+  lines.push('balance: ' + JSON.stringify({
+    status: balanceState.status, normal: balanceState.normal, bonus: balanceState.bonus,
+  }));
+  lines.push('raw: ' + (DIAG.raw || ''));
+  try {
+    const ids = Object.keys(costStore.last);
+    lines.push('todayCost: ' + todayCost().toFixed(6) + ' · days: ' + JSON.stringify(costStore.days));
+    lines.push('costSessions(' + ids.length + '): ' + ids.map((k) => k.slice(0, 14)).join(' , '));
+  } catch { lines.push('todayCost: unreadable'); }
+  try {
+    const raw = window.localStorage.getItem('dsh-plugin-whale:cost-sample');
+    lines.push('costSample: ' + (raw || (DIAG.costSample ? JSON.stringify(DIAG.costSample) : 'none')));
+  } catch { lines.push('costSample: unreadable'); }
+  lines.push('dom: ' + outlineText().split('\n').join(' | '));
+  lines.push('mode: ' + (DIAG.mode || '') + ' rowChildren: ' + DIAG.rowChildren);
+  return lines.join('\n');
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* 退回 execCommand */ }
+  try {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.cssText = 'position:fixed;left:-9999px;top:0';
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand('copy');
+    area.remove();
+    return ok;
+  } catch { return false; }
+}
+
+/* ------------------------------------------------ 消遣模式：开关与统计 */
+/* 开关只活在当前页面（刷新后回到关闭）；本轮数量在开启时清零，
+ * 历史最高按类型分别记录，落在 localStorage 里跨刷新保留。 */
+const PLAY_IDLE_MS = 5 * 60 * 1000;
+const SNACK_BASE_SPEED = 22;
+const SNACK_STATS_KEY = 'dsh-plugin-whale:snack-stats';
+
+const playState = { active: false, lastAction: 0 };
+const playRound = { fish: 0, bowl: 0 };
+
+function loadSnackStats() {
+  try {
+    const v = JSON.parse(window.localStorage.getItem(SNACK_STATS_KEY) || 'null');
+    const b = v && (v.best || v);
+    if (b && typeof b === 'object') {
+      return { best: { fish: Math.max(0, b.fish | 0), bowl: Math.max(0, b.bowl | 0) } };
+    }
+  } catch { /* ignore */ }
+  return { best: { fish: 0, bowl: 0 } };
+}
+
+const snackStats = loadSnackStats();
+
+function saveSnackStats() {
+  try {
+    window.localStorage.setItem(SNACK_STATS_KEY, JSON.stringify({ v: 1, best: snackStats.best }));
+  } catch { /* ignore */ }
+}
+
+const playListeners = new Set();
+function subscribePlay(fn) { playListeners.add(fn); return () => playListeners.delete(fn); }
+function getPlayActive() { return playState.active; }
+function playNotify() {
+  playListeners.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+}
+function playTouch() { playState.lastAction = Date.now(); }
+
+let playIdleTimer = 0;
+function playSet(on) {
+  on = !!on;
+  if (on === playState.active) return;
+  playState.active = on;
+  playState.lastAction = Date.now();
+  if (on) { playRound.fish = 0; playRound.bowl = 0; }
+  if (playIdleTimer) { clearInterval(playIdleTimer); playIdleTimer = 0; }
+  if (on) {
+    playIdleTimer = setInterval(() => {
+      if (!playState.active) return;
+      if (Date.now() - playState.lastAction < PLAY_IDLE_MS) return;
+      DIAG.playIdleExit = Date.now();
+      playSet(false);
+    }, 1000);
+  }
+  DIAG.play = on;
+  playNotify();
+}
+
+function recordSnackEaten(type) {
+  const key = type === 'fish' ? 'fish' : 'bowl';
+  playRound[key] += 1;
+  if (playRound[key] > snackStats.best[key]) {
+    snackStats.best[key] = playRound[key];
+    saveSnackStats();
+  }
+  DIAG.playEaten = { fish: playRound.fish, bowl: playRound.bowl };
+  playNotify();
+}
+
+function mountBalance() {
+  if (document.querySelector(`[${BALANCE_ATTR}]`)) return () => {};
+
+  const root = document.createElement('div');
+  root.setAttribute(BALANCE_ATTR, '1');
+  root.style.cssText = 'position:fixed;z-index:40;display:flex;';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.title = '余额';
+  btn.setAttribute('aria-label', '账户余额');
+  btn.setAttribute('aria-haspopup', 'dialog');
+  btn.setAttribute('aria-expanded', 'false');
+  btn.style.cssText = 'display:flex;align-items:center;justify-content:center;width:28px;height:28px;'
+    + 'padding:0;border:none;border-radius:8px;background:transparent;cursor:pointer;'
+    + 'color:var(--dsw-alias-state-business-primary,#4D6BFE)';
+  btn.innerHTML = iconMarkup('granary', 18);
+
+  const pop = document.createElement('div');
+  pop.setAttribute('data-whale-pop', '1');
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', '账户余额与用量');
+  pop.tabIndex = -1;
+  pop.style.cssText = 'position:fixed;display:none;outline:none;width:236px;padding:7px;border-radius:14px;'
+    + 'background:rgba(252,253,255,.86);'
+    + 'background:color-mix(in srgb, var(--dsw-alias-bg-overlay,#ffffff) 82%, transparent);'
+    + '-webkit-backdrop-filter:saturate(1.7) blur(22px);backdrop-filter:saturate(1.7) blur(22px);'
+    + 'border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.55));'
+    + 'box-shadow:0 18px 44px -22px rgba(15,20,32,.42),inset 0 1px 0 rgba(255,255,255,.7);'
+    + 'color:var(--dsw-alias-label-primary,#1b1f26);';
+
+  const row = (icon, label, amount, key) => '<div data-row="' + (key || icon) + '" '
+    + 'style="display:flex;align-items:center;gap:10px;padding:8px 10px">'
+    + `<span style="display:flex;color:var(--dsw-alias-state-business-primary,#4D6BFE)">${iconMarkup(icon, 20)}</span>`
+    + `<span style="font-size:12.5px;color:var(--dsw-alias-label-secondary,#5c6270)">${label}</span>`
+    + '<span style="margin-left:auto;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums" data-amt="'
+    + (key || icon) + '">' + amount + '</span></div>';
+
+  pop.innerHTML =
+    '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px 6px;font-size:12px;'
+    + 'color:var(--dsw-alias-label-tertiary,#9aa1ad)"><span data-head>账户余额</span>'
+    + '<span data-total style="margin-left:auto;font-weight:600;'
+    + 'color:var(--dsw-alias-label-secondary,#5c6270);font-variant-numeric:tabular-nums">—</span></div>'
+    + row('bowl-balance', '充值余额', '—')
+    + row('bowl-gift', '赠送余额', '—')
+    + row('bowl-spent', '今日消耗', '—', 'cost-today')
+    + playRowMarkup()
+    + '<div data-diag-block="1">'
+    + '<div style="display:flex;align-items:center;gap:8px;padding:2px 10px 6px">'
+    + '<button type="button" data-copy style="font-size:11px;padding:3px 10px;border-radius:999px;'
+    + 'border:1px solid var(--dsw-alias-border-l1,rgba(140,150,170,.35));'
+    + 'background:transparent;color:inherit;cursor:pointer">'
+    + '复制诊断</button>'
+    + '<span data-copied style="font-size:11px;color:var(--dsw-alias-state-business-primary,#4D6BFE);'
+    + 'display:none">已复制，可直接粘贴</span></div>'
+    + '<textarea data-report readonly style="display:none;box-sizing:border-box;width:100%;'
+    + 'height:120px;margin:0 0 4px;padding:6px 8px;border-radius:8px;resize:none;'
+    + 'border:1px solid var(--dsw-alias-border-l1,rgba(140,150,170,.3));'
+    + 'background:rgba(255,255,255,.62);'
+    + 'background:color-mix(in srgb, var(--dsw-alias-bg-layer-2,#ffffff) 70%, transparent);'
+    + 'font-family:ui-monospace,Menlo,monospace;font-size:9.5px;line-height:13px;'
+    + 'color:var(--dsw-alias-label-secondary,#5c6270)"></textarea>'
+    + '<div data-raw style="padding:0 10px 4px;font-size:9.5px;line-height:12px;'
+    + 'font-family:ui-monospace,Menlo,monospace;color:var(--dsw-alias-label-caption,#b3b9c4);'
+    + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>'
+    + '<div data-diag style="padding:4px 10px 2px;font-size:10.5px;line-height:14px;'
+    + 'color:var(--dsw-alias-label-caption,#b3b9c4);font-variant-numeric:tabular-nums;'
+    + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>'
+    + '</div>';
+
+  const alarmDot = document.createElement('i');
+  alarmDot.setAttribute('data-alarm', '1');
+  alarmDot.style.cssText = 'position:absolute;right:1px;top:1px;width:4px;height:4px;border-radius:50%;'
+    + 'background:#ff3b30;display:none;pointer-events:none';
+
+  root.append(btn, alarmDot, pop);
+  document.body.appendChild(root);
+
+  const amt = (icon) => pop.querySelector(`[data-amt="${icon}"]`);
+  const head = pop.querySelector('[data-head]');
+  const totalEl = pop.querySelector('[data-total]');
+  const diagEl = pop.querySelector('[data-diag]');
+  const diagBlock = pop.querySelector('[data-diag-block]');
+  const todayEl = pop.querySelector('[data-amt="cost-today"]');
+  const playLabelEl = pop.querySelector('[data-play-label]');
+  const countBowlEl = pop.querySelector('[data-count-bowl]');
+  const countFishEl = pop.querySelector('[data-count-fish]');
+  const whaleToggle = pop.querySelector('[data-whale-toggle]');
+  let cardWhaleOn = null;
+  const renderPlay = () => {
+    const on = playState.active;
+    const view = on ? playRound : snackStats.best;
+    if (countBowlEl) countBowlEl.textContent = String(view.bowl);
+    if (countFishEl) countFishEl.textContent = String(view.fish);
+    if (playLabelEl) playLabelEl.textContent = on ? '已吃掉' : '最高纪录';
+    if (whaleToggle) {
+      whaleToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+      whaleToggle.title = on ? '关闭消遣模式' : '开启消遣模式';
+    }
+    if (cardWhaleOn === on) return;
+    const first = cardWhaleOn === null;
+    cardWhaleOn = on;
+    animateCardWhale(on, !first);
+  };
+  const offPlay = subscribePlay(renderPlay);
+  if (whaleToggle) {
+    whaleToggle.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      playSet(!playState.active);
+    });
+  }
+  renderPlay();
+  const localDate = () => beijingParts().date;
+  let todayDate = '';
+
+  const refreshTodayCost = () => {
+    if (!todayEl) return;
+    const day = localDate();
+    if (day !== todayDate) { todayDate = day; }
+    const amount = todayCost();
+    todayEl.textContent = '¥' + amount.toFixed(2);
+    todayEl.title = '今日累计 ¥' + amount.toFixed(4)
+      + '（按 token 增量 × 当前时段单价累计，北京日 ' + day + '）';
+  };
+
+  const refreshDiagVisibility = () => {
+    if (!diagBlock) return;
+    const show = readSettings().showDiagnostics !== false;
+    diagBlock.style.display = show ? '' : 'none';
+  };
+
+  const applyTone = () => {
+    const { alertThreshold } = readSettings();
+    const ready = balanceState.status === 'ready';
+    // 阈值单位是「元」：只和人民币钱包比，混币种直接相加会把美元当人民币
+    const cnyWallets = sumWallets(balanceState.normal.concat(balanceState.bonus))
+      .filter((w) => w.currency === 'CNY');
+    const totalAmount = cnyWallets.reduce((sum, w) => sum + w.amount, 0);
+    const warned = ready && cnyWallets.length > 0 && alertThreshold > 0 && totalAmount < alertThreshold;
+    const color = warned
+      ? 'var(--dsw-alias-state-warn-primary, #F59E0B)'
+      : 'var(--dsw-alias-state-business-primary, #4D6BFE)';
+    btn.style.color = color;
+    const title = warned
+      ? '余额 ' + totalAmount.toFixed(2) + ' 低于预警值 ' + alertThreshold.toFixed(2) + '，点击充值或查看明细'
+      : '余额';
+    const checkDone = officialCheck.at > 0;
+    const checkFailed = checkDone && officialCheck.ok === false;
+    const checkNote = '（官方定价页连接失败）';
+    btn.title = checkFailed ? title + checkNote : title;
+    alarmDot.style.display = checkFailed ? 'block' : 'none';
+    return warned;
+  };
+
+  const render = () => {
+    try {
+      applyTone();
+      refreshTodayCost();
+      refreshDiagVisibility();
+      renderPlay();
+    const settings = readSettings();
+    const ready = balanceState.status === 'ready';
+    const total = sumWallets(balanceState.normal.concat(balanceState.bonus));
+    const st = balanceState.status;
+    head.textContent = ready ? '账户余额'
+      : st === 'loading' || st === 'refreshing' ? '读取中…'
+        : st === 'unavailable' ? '账户未连接'
+          : st === 'error' || st === 'failed' ? '读取失败'
+            : '账户余额';
+    head.title = st === 'failed' || st === 'error' ? (DIAG.balance || '') : '';
+    totalEl.textContent = ready ? formatMoney(total) : '—';
+    amt('bowl-balance').textContent = ready ? formatMoney(balanceState.normal) : '—';
+    amt('bowl-gift').textContent = ready ? formatMoney(balanceState.bonus) : '—';
+    // 赠送余额为 0（或读不到）时整行收起
+    const giftRow = pop.querySelector('[data-row="bowl-gift"]');
+    if (giftRow) {
+      const bonusTotal = sumWallets(balanceState.bonus).reduce((sum, w) => sum + w.amount, 0);
+      giftRow.style.display = ready && bonusTotal <= 0 ? 'none' : 'flex';
+    }
+    diagEl.textContent = diagText();
+    diagEl.title = JSON.stringify(DIAG);
+    const rawEl = pop.querySelector('[data-raw]');
+    if (rawEl) rawEl.textContent = DIAG.raw || '';
+    } catch (error) {
+      DIAG.renderError = String((error && error.message) || error);
+      debug({ renderError: DIAG.renderError });
+    }
+  };
+
+  let open = false;
+  let railRight = 0;   // 侧边栏右边缘（由 place() 更新）
+  const placePop = () => {
+    const r = btn.getBoundingClientRect();
+    const width = pop.offsetWidth || 250;
+    const height = pop.offsetHeight || 220;
+    const sideRight = railRight || r.right;
+    const roomInside = sideRight - 12 >= width;
+    let left;
+    if (roomInside) {
+      // 展开态：弹层落在侧边栏内侧、图标上方
+      left = Math.max(8, sideRight - width - 8);
+    } else {
+      // 折叠态：从图标栏右侧飞出，像抽屉一样
+      left = Math.max(8, Math.min(sideRight + 8, window.innerWidth - width - 8));
+    }
+    const above = r.top - height - 10 >= 8;
+    const top = above ? r.top - 10 - height : Math.min(window.innerHeight - height - 8, r.bottom + 10);
+    pop.style.left = Math.round(left) + 'px';
+    pop.style.top = Math.round(top) + 'px';
+  };
+
+  const close = () => {
+    if (!open) return;
+    open = false;
+    pop.style.display = 'none';
+    btn.setAttribute('aria-expanded', 'false');
+  };
+
+  const openPop = () => {
+    if (open) return;
+    open = true;
+    pop.style.display = 'block';
+    btn.setAttribute('aria-expanded', 'true');
+    render();
+    placePop();
+    try { pop.focus(); } catch { /* ignore */ }
+    fetchBalance().then(() => { if (open) { render(); placePop(); } });
+  };
+
+  const diagToggle = pop.querySelector('[data-diag-toggle]');
+  const diagPanel = pop.querySelector('[data-diag-panel]');
+  if (diagToggle && diagPanel) {
+    diagToggle.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const shown = diagPanel.style.display !== 'none';
+      diagPanel.style.display = shown ? 'none' : 'block';
+      diagToggle.style.opacity = shown ? '.75' : '1';
+      if (!shown) render();
+    });
+  }
+
+  const copyBtn = pop.querySelector('[data-copy]');
+  const copiedTip = pop.querySelector('[data-copied]');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const report = buildReport();
+      const area = pop.querySelector('[data-report]');
+      if (area) {
+        area.value = report;
+        area.style.display = 'block';
+        area.focus();
+        area.select();
+      }
+      const ok = await copyText(report);
+      if (copiedTip) {
+        copiedTip.textContent = ok ? '已复制，可直接粘贴' : '已选中，按 ⌘C 复制';
+        copiedTip.style.display = 'inline';
+        setTimeout(() => { copiedTip.style.display = 'none'; }, 2600);
+      }
+    });
+  }
+
+  btn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (open) close(); else openPop();
+  });
+  const onDocMouseDown = (ev) => {
+    if (!open) return;
+    if (root.contains(ev.target)) return;
+    close();
+  };
+  const onDocKeyDown = (ev) => { if (ev.key === 'Escape') close(); };
+  const onWindowResize = () => { if (open) placePop(); };
+  document.addEventListener('mousedown', onDocMouseDown, true);
+  document.addEventListener('keydown', onDocKeyDown);
+  window.addEventListener('resize', onWindowResize);
+
+  // 打开状态下的余额刷新由挂载末尾的统一巡检驱动（≥55 秒一次）
+  let lastFetch = 0;
+
+  // 定位：以“头像”为锚点。折叠栏 → 放到头像正上方；展开栏 → 放到账户按钮右端、指示器之前。
+  const findAvatar = () => {
+    const vh = window.innerHeight;
+    let best = null;
+    let bestTop = -Infinity;
+    const imgs = document.querySelectorAll('img');
+    for (let i = 0; i < imgs.length; i += 1) {
+      const el = imgs[i];
+      const r = el.getBoundingClientRect();
+      if (r.width < 16 || r.width > 44) continue;
+      if (Math.abs(r.width - r.height) > 8) continue;
+      if (r.left > 140) continue;
+      if (r.top < vh * 0.5) continue;
+      if (r.top > bestTop) { best = el; bestTop = r.top; }
+    }
+    return best;
+  };
+
+  const place = () => {
+    const size = 28;
+    const avatar = findAvatar();
+    let left = 12;
+    let top = window.innerHeight - 44;
+    let mode = 'none';
+
+    if (avatar) {
+      const row = avatar.closest('button') || avatar.parentElement || avatar;
+      const rowRect = row.getBoundingClientRect();
+      const kids = Array.from(row.children);
+      if (rowRect.width < 120) {
+        // 折叠成图标栏：头像上方居中
+        left = rowRect.left + (rowRect.width - size) / 2;
+        top = rowRect.top - size - 4;
+        mode = 'rail';
+      } else {
+        // 展开：放在账户按钮自身的右端内侧（名字之后、连接/更新指示器之前）
+        left = rowRect.right - size - 6;
+        if (left < rowRect.left + 4) left = rowRect.left + 4;
+        top = rowRect.top + (rowRect.height - size) / 2;
+        mode = 'row';
+      }
+      DIAG.row = true;
+      DIAG.rowChildren = kids.length;
+      // 记侧边栏右边缘（往上找一栏宽度 160–420、高度 >200 的容器）
+      let side = row;
+      let sideBest = null;
+      for (let i = 0; i < 7 && side; i += 1) {
+        const sr = side.getBoundingClientRect();
+        if (sr.width >= 160 && sr.width <= 420 && sr.height > 200) sideBest = sr;
+        side = side.parentElement;
+      }
+      railRight = sideBest ? sideBest.right : rowRect.right;
+      debug({ mode, rowY: Math.round(rowRect.top), rowW: Math.round(rowRect.width) });
+    } else {
+      DIAG.row = false;
+      DIAG.rowChildren = 0;
+      debug({ mode: 'no-avatar' });
+      const gear = Array.from(document.querySelectorAll('button')).find((b) => {
+        const text = (b.textContent || '').trim();
+        return text === '设置' || text === 'Settings';
+      });
+      if (gear) {
+        const r = gear.getBoundingClientRect();
+        left = Math.min(r.right + 6, window.innerWidth - size - 8);
+        top = r.top + (r.height - size) / 2;
+      }
+    }
+
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+    if (top < 0 || top > window.innerHeight) return;
+    root.style.left = Math.round(left) + 'px';
+    root.style.top = Math.round(top) + 'px';
+    if (open) placePop();
+  };
+
+  // 开发用：注入一份余额数据看渲染（仅调试开关打开时）
+  if (DEBUG_HOOKS) try {
+    window.__dshWhalePeak = () => peakStatus();
+    window.__dshWhaleCheck = (force) => ensureOfficialCheck(force !== false);
+  } catch { /* ignore */ }
+  if (DEBUG_HOOKS) try {
+    window.__dshWhaleFeed = (normal, bonus) => {
+      setBalance({ status: 'ready', normal: normal || [], bonus: bonus || [], at: Date.now() });
+      DIAG.balance = 'mock';
+      render();
+    };
+  } catch { /* ignore */ }
+
+  const cached = readLastBalance();
+  if (cached) {
+    setBalance({ status: 'ready', normal: cached.normal, bonus: cached.bonus, at: cached.at });
+  }
+  toneRefreshers.add(applyTone);
+  toneRefreshers.add(() => { refreshTodayCost(); refreshDiagVisibility(); });
+  applyTone();
+  // 余额一变，设置页与弹层同时刷新
+  balanceListeners.add(render);
+  // 账本一变，今日消耗立刻重算（不必等用户点开粮仓）
+  const offUsage = onUsageChanged(() => {
+    refreshTodayCost();
+    refreshDiagVisibility();
+    if (open) render();
+  });
+  const offSettings = subscribeSettings(applyTone);
+  // 启动即预热：打开 DSH 时弹层里的数字就已经是新的
+  refreshTodayCost();
+  refreshDiagVisibility();
+  // 服务可能比插件晚就绪：前 20 秒内多试几次
+  [800, 2000, 5000, 10000, 20000].forEach((delay) => {
+    setTimeout(() => {
+      if (balanceState.status !== 'ready') refreshBalanceTone();
+    }, delay);
+  });
+  place();
+  const placeTimer = setInterval(place, 600);
+  ensureOfficialCheck().then(() => applyTone());
+  fetchBalance().then(() => { if (open) render(); applyTone(); });
+  // 5 秒一次的轻量巡检：跨日重算 + 打开态按需刷余额，不做任何 DOM 扫描
+  const tickTimer = setInterval(() => {
+    if (todayDate && todayDate !== localDate()) refreshTodayCost();
+    if (!open) return;
+    if (Date.now() - lastFetch < 55000) return;
+    lastFetch = Date.now();
+    fetchBalance().then(() => { if (open) render(); applyTone(); });
+  }, 5000);
+  const slowTimer = setInterval(() => { fetchBalance().then(() => { if (open) render(); applyTone(); }); }, 300000);
+  const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(place) : null;
+  if (ro) ro.observe(document.body);
+
+  return () => {
+    root.remove();
+    if (ro) ro.disconnect();
+    document.removeEventListener('mousedown', onDocMouseDown, true);
+    document.removeEventListener('keydown', onDocKeyDown);
+    window.removeEventListener('resize', onWindowResize);
+    clearInterval(placeTimer);
+    clearInterval(tickTimer);
+    clearInterval(slowTimer);
+    balanceListeners.delete(render);
+    offUsage();
+    offSettings();
+    offPlay();
+    cancelAnimationFrame(cardWhaleAnim);
+    toneRefreshers.delete(applyTone);
+  };
+}
+
+/* ------------------------------------------------------ 2 号位：鲸鱼条 */
+
+const WAVES = [
+  { y: 14.0, amp: 3.0, lam: 92, dash: '40 14 20 10 30 13', op: 0.20, rel: 0.45, inset: 0.24 },
+  { y: 20.0, amp: 2.5, lam: 70, dash: '30 11 16 8 24 11', op: 0.32, rel: 0.66, inset: 0.17 },
+  { y: 26.5, amp: 2.1, lam: 54, dash: '22 9 13 7 18 9', op: 0.50, rel: 0.90, inset: 0.11 },
+  { y: 32.0, amp: 1.8, lam: 42, dash: '18 8 11 6 14 8', op: 0.90, rel: 1.30, inset: 0.06 },
+];
+const WATER_Y = 32;
+/* 喷水动作暂时关闭；想恢复改成 true 即可（会同时恢复 1.5s 的喷水过渡延迟）。 */
+const SPOUT_ENABLED = false;
+const SNACK_COLOR = '#f29b38';
+const BOWL_ICON_MAIN = (ICONS['bowl-balance'] && ICONS['bowl-balance'].main) || [];
+/* 米饭图标 fine 组里前三条是热气，去掉，只留碗底那条 */
+const BOWL_ICON_FINE = ((ICONS['bowl-balance'] && ICONS['bowl-balance'].fine) || []).filter((d) => {
+  const m = /^M\s*-?[\d.]+[ ,](-?[\d.]+)/.exec(d);
+  return !m || parseFloat(m[1]) > 12;
+});
+const MODES = {
+  idle: { speed: 12, tail: 4.2, amp: 0.50, bob: 1.0, wa: 0.75, wl: 1.20, depth: 4.0 },
+  thinking: { speed: 30, tail: 3.2, amp: 0.80, bob: 1.6, wa: 0.85, wl: 1.12, depth: 3.0 },
+  working: { speed: 64, tail: 2.2, amp: 1.00, bob: 1.8, wa: 1.00, wl: 1.00, depth: 0.0 },
+};
+const SCALE = 0.27, ROT = -8, CX = 74.8, CY = 54.3, K = 0.675;
+const PHASE_OFF = [0, 0.27, 0.53, 0.81];
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+/** 该层虚线的实线段长度（从 dasharray 的偶数位里随机取一个），让绿段长度与之一致。 */
+const DASH_CACHE = new Map();
+function dashLengthOf(layer) {
+  if (!DASH_CACHE.has(layer)) {
+    const raw = (WAVES[layer] && WAVES[layer].dash) || '';
+    const parts = raw.split(/[\s,]+/).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+    const on = parts.filter((_, i) => i % 2 === 0);
+    DASH_CACHE.set(layer, on.length ? on : [40]);
+  }
+  const on = DASH_CACHE.get(layer);
+  return on[Math.floor(Math.random() * on.length)];
+}
+
+/* 鲸鱼身体轮廓（模块级：卡片小图标和状态条共用） */
+function bodyByAngle(deg) {
+  const a = deg * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+  const px = 122, py = 41;
+  const mv = (x, y, w) => {
+    if (w === 0) return [x, y];
+    const dx = x - px, dy = y - py;
+    return [px + dx * ca - dy * sa, py + dx * sa + dy * ca];
+  };
+  const s0 = SEGS[0];
+  let d = 'M' + mv(s0[0], s0[1], WSEG[0][0]).map((v) => v.toFixed(2)).join(' ');
+  for (let i = 0; i < SEGS.length; i++) {
+    const s = SEGS[i], w0 = WSEG[i][0], w1 = WSEG[i][1];
+    const a1 = mv(s[2], s[3], w0 + (w1 - w0) / 3);
+    const b1 = mv(s[4], s[5], w0 + 2 * (w1 - w0) / 3);
+    const c1 = mv(s[6], s[7], w1);
+    d += 'C' + a1[0].toFixed(2) + ' ' + a1[1].toFixed(2) + ' ' +
+      b1[0].toFixed(2) + ' ' + b1[1].toFixed(2) + ' ' +
+      c1[0].toFixed(2) + ' ' + c1[1].toFixed(2);
+  }
+  return d;
+}
+
+function createEngine(svgEl, hooks = {}) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const H = 44;
+  const state = {
+    W: 560, style: 'line', mode: 'idle', prevMode: 'idle', blend: 1, blendDelay: 0,
+    wavePhase: [0, 0, 0, 0], elapsed: 0, last: 0, raf: 0,
+    spoutOn: false, spout: 0, spoutCfg: null, spoutDur: 1.5,
+    feeding: false, feed: 0,
+    play: false, snack: null, playJump: null, playSplash: null, burst: null,
+    snackSpeed: SNACK_BASE_SPEED, playSpawnIn: 0.9,
+  };
+  let nodes = null;
+  let bubbles = [];
+  const greenEls = [];
+  let greenPick = { layer: -1, x: 0, len: 0 };
+
+  function el(tag, attrs) {
+    const n = document.createElementNS(NS, tag);
+    if (attrs) for (const k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+
+  function defsMarkup() {
+    let d = '';
+    WAVES.forEach((w, i) => {
+      const a = w.inset;
+      d += `<linearGradient id="dshw-eg${i}" x1="0" y1="0" x2="1" y2="0">` +
+        `<stop offset="0" stop-color="#000"/><stop offset="${a}" stop-color="#fff"/>` +
+        `<stop offset="${1 - a}" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient>` +
+        `<mask id="dshw-em${i}" maskUnits="userSpaceOnUse" x="0" y="0" width="${state.W}" height="${H}">` +
+        `<rect width="${state.W}" height="${H}" fill="url(#dshw-eg${i})"/></mask>`;
+    });
+    d += `<mask id="dshw-water" maskUnits="userSpaceOnUse" x="0" y="0" width="${state.W}" height="${H}">` +
+      `<rect width="${state.W}" height="${H}" fill="#fff"/><path id="dshw-waterPath" fill="#000"/></mask>` +
+      `<mask id="dshw-hole" maskUnits="userSpaceOnUse" x="0" y="0" width="${state.W}" height="${H}">` +
+      `<rect width="${state.W}" height="${H}" fill="#fff"/>` +
+      `<g mask="url(#dshw-water)"><g id="dshw-holeG"><path id="dshw-holePath" fill="#000"/></g></g></mask>`;
+    return d;
+  }
+
+  function build() {
+    const box = svgEl.parentElement;
+    const cssW = (box && box.clientWidth) || 232;
+    const cssH = svgEl.clientHeight || 36;
+    state.W = Math.max(320, Math.round(cssW * H / cssH));
+    svgEl.setAttribute('viewBox', `0 0 ${state.W} ${H}`);
+    svgEl.innerHTML = '';
+
+    const defs = el('defs');
+    defs.innerHTML = defsMarkup();
+    svgEl.appendChild(defs);
+
+    const gBack = el('g');
+    svgEl.appendChild(gBack);
+    const waveEls = [];
+    WAVES.slice(0, 3).forEach((w, i) => {
+      const wrap = el('g', { mask: `url(#dshw-em${i})` });
+      const p = el('path', {
+        fill: 'none', stroke: 'currentColor', 'stroke-width': 1.5, 'stroke-linecap': 'round',
+        'stroke-dasharray': w.dash, 'stroke-opacity': w.op,
+      });
+      wrap.appendChild(p);
+      gBack.appendChild(wrap);
+      waveEls.push(p);
+      const green = el('path', {
+        fill: 'none', stroke: GREEN_COLOR, 'stroke-width': 1.7, mask: `url(#dshw-em${i})`,
+        'stroke-linecap': 'round', 'stroke-opacity': Math.max(0.5, w.op), d: '',
+      });
+      greenEls.push(green);
+    });
+    // 绿段统一放在背景层之后：压在同层线条上，同时仍在挖空遮罩内（会被鲸鱼挡住）
+    const gGreenBack = el('g');
+    gBack.appendChild(gGreenBack);
+    greenEls.slice(0, 3).forEach((g) => gGreenBack.appendChild(g));
+    const gFish = el('g');
+    gBack.appendChild(gFish);
+    const gSnack = el('g');
+    gBack.appendChild(gSnack);
+
+    const gWhaleWrap = el('g', { mask: 'url(#dshw-water)' });
+    const gWhale = el('g');
+    const gInner = el('g', {
+      fill: 'none', stroke: 'currentColor', 'stroke-width': 5.0,
+      'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    });
+    const pBody = el('path');
+    const pStatic = el('path', { d: STATIC_D });
+    gInner.appendChild(pBody);
+    gInner.appendChild(pStatic);
+    gWhale.appendChild(gInner);
+    gWhaleWrap.appendChild(gWhale);
+    svgEl.appendChild(gWhaleWrap);
+
+    const gFrontWrap = el('g', { mask: 'url(#dshw-em3)' });
+    const pFront = el('path', {
+      fill: 'none', stroke: 'currentColor', 'stroke-width': 1.8, 'stroke-linecap': 'round',
+      'stroke-dasharray': WAVES[3].dash, 'stroke-opacity': WAVES[3].op,
+    });
+    gFrontWrap.appendChild(pFront);
+    const greenFront = el('path', {
+      fill: 'none', stroke: GREEN_COLOR, 'stroke-width': 2,
+      'stroke-linecap': 'round', 'stroke-opacity': Math.max(0.6, WAVES[3].op), d: '',
+    });
+    gFrontWrap.appendChild(greenFront);
+    greenEls.push(greenFront);
+    svgEl.appendChild(gFrontWrap);
+
+    const gFx = el('g');
+    svgEl.appendChild(gFx);
+    const gBub = el('g');
+    svgEl.appendChild(gBub);
+
+    const maskRects = Array.from(defs.querySelectorAll('mask > rect'));
+
+    nodes = {
+      waveEls, gFish, gSnack, gWhale, gInner, pBody, pStatic, pFront, gFx, gBub, maskRects,
+      waterPath: svgEl.querySelector('#dshw-waterPath'),
+      holeG: svgEl.querySelector('#dshw-holeG'),
+      holePath: svgEl.querySelector('#dshw-holePath'),
+    };
+
+    applyStyle();
+
+    if (bubbles.length === 0) {
+      for (let i = 0; i < 6; i++) {
+        bubbles.push([(Math.random() * 2 - 1) * 9, 1.5 + Math.random() * 1.9,
+        Math.random(), 0.6 + Math.random() * 0.5]);
+      }
+    }
+  }
+
+  /** 判断当前主色是不是浅色（暗色主题下的完全权限会是近白色）。 */
+  function isLightColor(value) {
+    const m = /rgba?\(([^)]+)\)/.exec(String(value || ''));
+    if (!m) return false;
+    const parts = m[1].split(',').map((v) => parseFloat(v));
+    const r = parts[0], g = parts[1], b = parts[2];
+    if (![r, g, b].every((n) => Number.isFinite(n))) return false;
+    return (r * 0.299 + g * 0.587 + b * 0.114) > 170;
+  }
+
+  /** 线稿 / 填色：只改属性，不重建节点，切换时鲸鱼不会跳。 */
+  function applyStyle() {
+    if (!nodes || !nodes.gInner) return;
+    const fill = state.style === 'fill';
+    const g = nodes.gInner;
+    g.setAttribute('fill', fill ? 'currentColor' : 'none');
+    g.setAttribute('stroke', 'currentColor');
+    g.setAttribute('stroke-width', fill ? 1 : 5);
+    if (fill) {
+      // 腹部 / 眼状斑 / 眼睛：与官方 logo 一致，做白色实心留白（不再描成一条线）。
+      // 主色本身接近白色时（暗色主题的完全权限）改取页面底色，保证还有对比。
+      let bodyColor = '';
+      try { bodyColor = getComputedStyle(svgEl).color || ''; } catch { bodyColor = ''; }
+      state.bodyColor = bodyColor;
+      nodes.pStatic.setAttribute('fill-rule', 'evenodd');
+      nodes.pStatic.setAttribute('stroke-width', '0');
+      nodes.pStatic.style.fill = isLightColor(bodyColor)
+        ? 'var(--dsw-alias-bg-base, #1b1f26)'
+        : '#ffffff';
+      nodes.pStatic.style.stroke = 'none';
+    } else {
+      nodes.pStatic.removeAttribute('stroke-width');
+      nodes.pStatic.removeAttribute('fill-rule');
+      nodes.pStatic.style.fill = '';
+      nodes.pStatic.style.stroke = '';
+    }
+  }
+
+  function wavePath(y, amp, lam, phase) {
+    let d = '', first = true;
+    for (let x = -2 * lam; x <= state.W + 2 * lam; x += 2) {
+      d += (first ? 'M' : ' L') + x.toFixed(1) + ' ' +
+        (y + amp * Math.sin(2 * Math.PI * (x / lam + phase))).toFixed(2);
+      first = false;
+    }
+    return d;
+  }
+
+  function spoutCfg(seed) {
+    let s = (seed * 100003) | 0;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+    const dots = [];
+    for (let i = 0; i < 2; i++) {
+      dots.push([0.30 + rnd() * 0.25, 0.40 + rnd() * 0.22, -1.2 + rnd() * 2.4, -1 + rnd() * 2]);
+    }
+    return {
+      lines: rnd() < 0.5 ? 3 : 2,
+      spread: (4.0 + rnd() * 2.0) * K,
+      h: (12.0 + rnd() * 3.0) * K,
+      lean: -0.5 + rnd() * 1.0,
+      dots,
+    };
+  }
+
+  function spoutMarkup(x, y, s, cfg) {
+    const raw = Math.min(1, s / 0.30);
+    const grow = 1 - Math.pow(1 - raw, 2.2);
+    const fade = s < 0.70 ? 1 : Math.max(0, (1 - s) / 0.30);
+    const hh = cfg.h * grow, spread = cfg.spread * grow;
+    const op = 'stroke-opacity="' + (0.9 * fade).toFixed(2) + '"';
+    const endY = y - hh * 0.74;
+    let out = '<path d="M' + x.toFixed(2) + ' ' + y.toFixed(2) + 'C' + (x + 0.25).toFixed(2) + ' ' +
+      (y - hh * 0.35).toFixed(2) + ' ' + (x + cfg.lean * 0.6).toFixed(2) + ' ' +
+      (y - hh * 0.68).toFixed(2) + ' ' + (x + cfg.lean).toFixed(2) + ' ' +
+      (y - hh * 0.86).toFixed(2) + '" fill="none" stroke="currentColor" stroke-width="1.3" ' +
+      'stroke-linecap="round" ' + op + '/>';
+    [-1, 1].forEach((sd) => {
+      if (cfg.lines === 2 && sd < 0) return;
+      out += '<path d="M' + x.toFixed(2) + ' ' + y.toFixed(2) + 'C' + (x + sd * 0.55).toFixed(2) + ' ' +
+        (y - hh * 0.92).toFixed(2) + ' ' + (x + sd * spread * 0.86).toFixed(2) + ' ' +
+        (endY - 0.1).toFixed(2) + ' ' + (x + sd * spread).toFixed(2) + ' ' + endY.toFixed(2) +
+        '" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" ' + op + '/>';
+    });
+    cfg.dots.forEach((dd) => {
+      const px = x + dd[2] * spread * 0.55, py = y - hh * dd[1];
+      out += '<path d="M' + px.toFixed(2) + ' ' + py.toFixed(2) + 'l' + (0.75 * dd[3]).toFixed(2) +
+        ' -1.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" ' +
+        'stroke-opacity="' + (0.8 * fade).toFixed(2) + '"/>';
+    });
+    return out;
+  }
+
+  function splashMarkup(x, y, amt) {
+    if (amt <= 0) return '';
+    let out = '';
+    [0, -4.5, 4.5].forEach((dx, i) => {
+      const r = (3.2 * amt + 0.6 * Math.abs(i - 1)) * K;
+      out += '<path d="M' + (x + dx - r).toFixed(2) + ' ' + y.toFixed(2) + 'A' + r.toFixed(2) + ' ' +
+        (r * 0.55).toFixed(2) + ' 0 0 1 ' + (x + dx + r).toFixed(2) + ' ' + y.toFixed(2) +
+        '" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" ' +
+        'stroke-opacity="' + (0.55 * amt).toFixed(2) + '"/>';
+    });
+    for (let i = 0; i < 3; i++) {
+      const px = x + (-5 + i * 5) * K * (0.6 + amt), py = y - (4 + i * 2) * K * amt;
+      out += '<circle cx="' + px.toFixed(2) + '" cy="' + py.toFixed(2) + '" r="' +
+        (0.85 * amt + 0.2).toFixed(2) + '" fill="currentColor" fill-opacity="' +
+        (0.5 * amt).toFixed(2) + '"/>';
+    }
+    return out;
+  }
+
+  function fishPath(x, y, w) {
+    return 'M' + (x - 3 * w).toFixed(1) + ' ' + y.toFixed(1) +
+      'q' + (3 * w).toFixed(1) + ' ' + (-2.6 * w).toFixed(1) + ' ' + (6 * w).toFixed(1) +
+      ' 0q' + (-3 * w).toFixed(1) + ' ' + (2.6 * w).toFixed(1) + ' ' + (-6 * w).toFixed(1) + ' 0Z' +
+      'M' + (x - 3 * w).toFixed(1) + ' ' + y.toFixed(1) + 'l' + (-2 * w).toFixed(1) + ' ' +
+      (-1.8 * w).toFixed(1) + 'v' + (3.6 * w).toFixed(1) + 'Z';
+  }
+
+  function splashStrength(p) {
+    if (p <= 0) return 0;
+    const takeoff = Math.max(0, 1 - Math.abs(p - 0.11) / 0.055);
+    const landing = Math.max(0, 1 - Math.abs(p - 0.43) / 0.055);
+    return Math.min(1, Math.max(takeoff, landing));
+  }
+
+  function feedMotion(p) {
+    const sm = (u) => { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); };
+    const f = p < 0.30 ? sm(p / 0.30) : 1 - sm((p - 0.30) / 0.70);
+    const q = Math.max(0, Math.min(1, (p - 0.08) / 0.37));
+    const leap = p > 0.08 ? Math.sin(Math.PI * q) : 0;
+    return [37.8 * f, 6.75 * leap, -6 * leap];
+  }
+
+  /* ---------------- 消遣模式：右漂零食、固定跳跃、落水判定 ---------------- */
+
+  function bowlSnackMarkup(cx, cy, scale) {
+    const inner = BOWL_ICON_MAIN.map((d) => '<path d="' + d + '" stroke-width="1.6"/>').join('')
+      + BOWL_ICON_FINE.map((d) => '<path d="' + d + '" stroke-width="1.1"/>').join('');
+    return '<g transform="translate(' + cx.toFixed(2) + ' ' + cy.toFixed(2) + ') scale(' + scale + ') '
+      + 'translate(-12 -15.2)" fill="none" stroke="currentColor" stroke-linecap="round" '
+      + 'stroke-linejoin="round">' + inner + '</g>';
+  }
+
+  function snackMarkup(sn) {
+    const bob = Math.sin(state.elapsed * 2.1 + sn.phase) * 0.6;
+    if (sn.type === 'bowl') return bowlSnackMarkup(sn.x, WATER_Y - 4.2 + bob + sn.sink, 1.05);
+    const y = WATER_Y - 7.2 + bob + sn.sink;
+    const w = 1.475;
+    return '<path d="' + fishPath(sn.x, y, w) + '" fill="none" stroke="currentColor" '
+      + 'stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<circle cx="' + (sn.x + 2.1 * w).toFixed(2) + '" cy="' + (y - 0.45 * w).toFixed(2) + '" '
+      + 'r="0.62" fill="currentColor"/>';
+  }
+
+  function burstMarkup(x, t) {
+    const k = Math.min(1, t / 0.5);
+    let out = '';
+    for (let i = 0; i < 4; i++) {
+      const a = -Math.PI * (0.18 + i * 0.21);
+      const d = 3 + k * 6;
+      out += '<circle cx="' + (x + Math.cos(a) * d).toFixed(2) + '" cy="'
+        + (WATER_Y - 3 + Math.sin(a) * d * 0.8 - k * 2).toFixed(2) + '" r="'
+        + (1.15 * (1 - k) + 0.25).toFixed(2) + '" fill="' + SNACK_COLOR
+        + '" fill-opacity="' + (0.95 * (1 - k)).toFixed(2) + '"/>';
+    }
+    return out;
+  }
+
+  function spawnSnack() {
+    if (!state.play || state.playJump || state.snack) return null;
+    state.snack = {
+      type: Math.random() < 0.62 ? 'fish' : 'bowl',
+      x: -16,
+      op: 0,
+      sink: 0,
+      phase: Math.random() * Math.PI * 2,
+      leaving: false,
+    };
+    return state.snack;
+  }
+
+  /** 落水瞬间（p=0.45）嘴边的位置；只有这一刻碰到零食才算吃到。 */
+  function judgeLanding() {
+    const fm = feedMotion(0.45);
+    const mouthX = state.W * 0.5 - fm[0] - 8;
+    DIAG.playLandingX = Math.round(mouthX * 10) / 10;
+    const sn = state.snack;
+    if (sn && !sn.leaving && Math.abs(sn.x - mouthX) <= 14) {
+      state.playSplash = { x: sn.x, t: 0 };
+      state.burst = { x: sn.x, t: 0 };
+      const type = sn.type;
+      state.snack = null;
+      if (hooks.onSnack) { try { hooks.onSnack(type); } catch { /* ignore */ } }
+    } else {
+      state.playSplash = { x: mouthX, t: 0 };
+    }
+  }
+
+  function updatePlay(dt) {
+    if (!state.play) return;
+    if (state.snack) {
+      const sn = state.snack;
+      sn.x += dt * state.snackSpeed;
+      if (!sn.leaving && sn.x > state.W * 0.58) sn.leaving = true;
+      if (sn.leaving) {
+        sn.sink += dt * 9;
+        sn.op = Math.max(0, 1 - sn.sink / 15);
+      } else {
+        sn.op = Math.min(1, Math.max(0, (sn.x + 16) / 16));
+      }
+      if (sn.leaving && sn.op <= 0.01) {
+        state.snack = null;
+        state.playSpawnIn = 1.2 + Math.random() * 1.2;
+      }
+    } else if (!state.playJump) {
+      state.playSpawnIn -= dt;
+      if (state.playSpawnIn <= 0) spawnSnack();
+    }
+    if (state.playJump) {
+      const j = state.playJump;
+      j.t += dt / 2.6;
+      if (!j.takeoff && j.t >= 0.11) {
+        j.takeoff = true;
+        state.playSplash = { x: state.W * 0.5 - feedMotion(j.t)[0] + 6, t: 0 };
+      }
+      if (!j.judged && j.t >= 0.45) { j.judged = true; judgeLanding(); }
+      if (j.t >= 1) {
+        state.playJump = null;
+        if (!state.snack) state.playSpawnIn = 0.4 + Math.random() * 0.8;
+      }
+    }
+    if (state.playSplash) {
+      state.playSplash.t += dt;
+      if (state.playSplash.t > 0.55) state.playSplash = null;
+    }
+    if (state.burst) {
+      state.burst.t += dt;
+      if (state.burst.t > 0.5) state.burst = null;
+    }
+  }
+
+  function frame(now) {
+    if (!nodes) return;
+    const dt = Math.min(0.05, (now - state.last) / 1000 || 0.016);
+    state.last = now;
+    state.elapsed += dt;
+
+    if (state.feeding) {
+      state.feed += dt / 2.6;
+      if (state.feed >= 1) { state.feeding = false; state.feed = 0; }
+    }
+    updatePlay(dt);
+    if (state.spoutOn) {
+      state.spout += dt / state.spoutDur;
+      if (state.spout >= 1) { state.spoutOn = false; state.spout = 0; }
+    }
+    if (state.blendDelay > 0) state.blendDelay -= dt;
+    else if (state.blend < 1) state.blend = Math.min(1, state.blend + dt / 1.4);
+
+    const cfg = MODES[state.mode], prev = MODES[state.prevMode];
+    const speed = lerp(prev.speed, cfg.speed, state.blend);
+    const depth = lerp(prev.depth, cfg.depth, state.blend);
+    const wa = lerp(prev.wa, cfg.wa, state.blend);
+    const wl = lerp(prev.wl, cfg.wl, state.blend);
+
+    const fm = state.feeding ? feedMotion(state.feed)
+      : state.playJump ? feedMotion(Math.min(1, state.playJump.t))
+        : [0, 0, 0];
+    const x = state.W * 0.5 - fm[0];
+    const y = 21.5 + depth - fm[1] + cfg.bob * Math.sin(2 * Math.PI * state.elapsed / 3.1);
+    const tf = 'translate(' + (x - SCALE * CX).toFixed(2) + ' ' + (y - SCALE * CY).toFixed(2) +
+      ') scale(' + SCALE + ') rotate(' + (ROT + fm[2]).toFixed(2) + ' ' + CX + ' ' + CY + ')';
+    nodes.gWhale.setAttribute('transform', tf);
+
+    const tailAmp = cfg.amp * (state.feeding || state.playJump ? 1.35 : 1);
+    const ang = tailAmp * SWING * Math.sin(2 * Math.PI * state.elapsed / cfg.tail);
+    const d = bodyByAngle(ang);
+    nodes.pBody.setAttribute('d', d);
+    if (nodes.holeG) nodes.holeG.setAttribute('transform', tf);
+    if (nodes.holePath) nodes.holePath.setAttribute('d', d);
+
+    nodes.waveEls.forEach((p, i) => {
+      const w = WAVES[i];
+      state.wavePhase[i] -= dt * speed * w.rel / w.lam;
+      p.setAttribute('d', wavePath(w.y, w.amp * wa, w.lam * wl, 0));
+      p.setAttribute('transform',
+        'translate(' + (-(((state.wavePhase[i] % 1) + 1) % 1) * w.lam * wl).toFixed(2) + ' 0)');
+    });
+
+    const fw = WAVES[3];
+    state.wavePhase[3] -= dt * speed * fw.rel / fw.lam;
+    const fOff = (((state.wavePhase[3] % 1) + 1) % 1) * fw.lam * wl;
+    nodes.pFront.setAttribute('d', wavePath(fw.y, fw.amp * wa, fw.lam * wl, 0));
+    nodes.pFront.setAttribute('transform', 'translate(' + (-fOff).toFixed(2) + ' 0)');
+
+    {
+      const wy = fw.y, amp = fw.amp * wa, lam = fw.lam * wl;
+      let s = '', first = true;
+      for (let px = -2 * lam; px <= state.W + 2 * lam; px += 2) {
+        s += (first ? 'M' : ' L') + px.toFixed(1) + ' ' +
+          (wy + amp * Math.sin(2 * Math.PI * (px / lam))).toFixed(2);
+        first = false;
+      }
+      s += 'L' + (state.W + 2 * lam).toFixed(1) + ' ' + (H + 10) + 'L' +
+        (-2 * lam).toFixed(1) + ' ' + (H + 10) + 'Z';
+      if (nodes.waterPath) {
+        nodes.waterPath.setAttribute('d', s);
+        nodes.waterPath.setAttribute('transform', 'translate(' + (-fOff).toFixed(2) + ' 0)');
+      }
+    }
+
+    nodes.gBub.innerHTML = '';
+    const wly = fw.y + fw.amp * wa * Math.sin(2 * Math.PI * (x / (fw.lam * wl) + state.wavePhase[3]));
+    bubbles.forEach((b) => {
+      const cyc = ((state.elapsed / b[1] + b[2]) % 1 + 1) % 1;
+      const a = Math.sin(Math.PI * cyc);
+      if (a < 0.22) return;
+      nodes.gBub.appendChild(el('circle', {
+        cx: (x + b[0] * (1 - 0.25 * cyc)).toFixed(1),
+        cy: (wly - 0.6 - cyc * 5).toFixed(2),
+        r: (b[3] * (0.7 + 0.5 * a)).toFixed(2),
+        fill: 'none', stroke: 'currentColor',
+        'stroke-opacity': (0.42 * a).toFixed(2), 'stroke-width': 1.0,
+      }));
+    });
+
+    nodes.gFish.innerHTML = '';
+    if (state.feeding && state.feed < 0.46) {
+      nodes.gFish.appendChild(el('path', {
+        d: fishPath(state.W * 0.5 - 37.8 - 7, WATER_Y - 5.4, 1.0),
+        fill: 'none', stroke: 'currentColor', 'stroke-width': 1.2,
+        'stroke-linecap': 'round', 'stroke-opacity': 0.8,
+      }));
+    }
+
+    nodes.gSnack.innerHTML = '';
+    if (state.play && state.snack) {
+      const sn = state.snack;
+      nodes.gSnack.innerHTML = '<g color="' + SNACK_COLOR + '" opacity="' + sn.op.toFixed(2) + '">'
+        + snackMarkup(sn) + '</g>';
+    }
+
+    nodes.gFx.innerHTML = '';
+    if (SPOUT_ENABLED && state.spoutOn && state.spout > 0 && state.spoutCfg) {
+      nodes.gFx.innerHTML += spoutMarkup(x - 6.4, y - 8.9, state.spout, state.spoutCfg);
+    }
+    if (state.feeding) {
+      const sp = splashStrength(state.feed);
+      if (sp > 0.02) nodes.gFx.innerHTML += splashMarkup(x + 8, WATER_Y, sp);
+    }
+    if (state.playSplash) {
+      const amt = 1 - state.playSplash.t / 0.55;
+      if (amt > 0) nodes.gFx.innerHTML += splashMarkup(state.playSplash.x, WATER_Y, amt);
+    }
+    if (state.burst) nodes.gFx.innerHTML += burstMarkup(state.burst.x, state.burst.t);
+
+    // 谷时高亮：随机挑一层的一段线，染成同深浅的绿色（出错不影响整条动画）
+    // 填色模式下主色可能随权限/主题变化（蓝 ↔ 深色 ↔ 白）：变了就重算留白颜色
+    if (state.style === 'fill') {
+      state.colorTick = (state.colorTick || 0) + 1;
+      if (state.colorTick % 45 === 0) {
+        try {
+          const nowColor = getComputedStyle(svgEl).color || '';
+          if (nowColor !== state.bodyColor) applyStyle();
+        } catch { /* ignore */ }
+      }
+    }
+
+    try { updateGreen(dt); } catch (error) { DIAG.greenError = String((error && error.message) || error); }
+
+    state.raf = requestAnimationFrame(frame);
+  }
+
+  /** 谷时（非高峰）随机高亮一段；高峰时全部清空。 */
+  /** 谷时高亮一段：单向匀速前进，走出左侧后从右侧重新开始（随机换层/换长度）。 */
+  function updateGreen(dt) {
+    const status = peakStatus();
+    DIAG.peak = status.peak ? 'peak' : STATUS_LABEL[status.reason] || status.reason;
+    if (status.peak) {
+      if (greenPick.layer !== -1) {
+        greenPick = { layer: -1, x: 0, len: 0 };
+        greenEls.forEach((g) => { g.setAttribute('d', ''); g.removeAttribute('transform'); });
+      }
+      return;
+    }
+
+    if (greenPick.layer === -1) {
+      const layer = Math.floor(Math.random() * WAVES.length);
+      greenPick = { layer, x: state.W * (0.25 + Math.random() * 0.4), len: dashLengthOf(layer) };
+    }
+
+    greenPick.x -= dt * 46;   // 单向匀速，不反向
+    if (greenPick.x + greenPick.len < -8) {
+      // 已完全离开左侧：从右侧重新进入（边缘有淡出遮罩，看不出跳变）
+      const layer = Math.floor(Math.random() * WAVES.length);
+      greenPick = { layer, x: state.W + 8, len: dashLengthOf(layer) };
+    }
+
+    const boost = readSettings().greenBrightness;
+    if (updateGreen.lastBoost !== boost) {
+      updateGreen.lastBoost = boost;
+      const stroke = greenStrokeFor(boost);
+      greenEls.forEach((g) => g.setAttribute('stroke', stroke));
+    }
+
+    greenEls.forEach((g, i) => {
+      if (i !== greenPick.layer) { g.setAttribute('d', ''); return; }
+      const w = WAVES[i];
+      const mode = MODES[state.mode], prev = MODES[state.prevMode];
+      const wa = lerp(prev.wa, mode.wa, state.blend);
+      const wl = lerp(prev.wl, mode.wl, state.blend);
+      const amp = w.amp * wa;
+      const lam = w.lam * wl;
+      // 屏幕坐标下的等效相位（等价于“相位 0 路径 + translate(-off)”）
+      const phase = ((state.wavePhase[i] % 1) + 1) % 1;
+      let d = '';
+      for (let x = greenPick.x; x <= greenPick.x + greenPick.len; x += 2) {
+        d += (d ? ' L' : 'M') + x.toFixed(1) + ' ' +
+          (w.y + amp * Math.sin(2 * Math.PI * (x / lam + phase))).toFixed(2);
+      }
+      g.setAttribute('d', d);
+      g.removeAttribute('transform');
+    });
+  }
+
+  function resize() {
+    const box = svgEl.parentElement;
+    const cssW = (box && box.clientWidth) || 232;
+    const cssH = svgEl.clientHeight || 36;
+    const next = Math.max(320, Math.round(cssW * H / cssH));
+    if (next === state.W) return;
+    state.W = next;
+    svgEl.setAttribute('viewBox', `0 0 ${state.W} ${H}`);
+    if (nodes && nodes.maskRects) nodes.maskRects.forEach((r) => r.setAttribute('width', state.W));
+  }
+
+  return {
+    build,
+    resize,
+    start() {
+      if (state.raf) return;
+      state.last = performance.now();
+      state.raf = requestAnimationFrame(frame);
+    },
+    stop() {
+      if (state.raf) cancelAnimationFrame(state.raf);
+      state.raf = 0;
+    },
+    setMode(mode, { spout = true } = {}) {
+      if (state.play) return;   // 消遣模式接管期间不接受状态切换
+      if (!MODES[mode] || mode === state.mode) return;
+      state.prevMode = state.mode;
+      state.mode = mode;
+      state.blend = 0;
+      state.blendDelay = spout && SPOUT_ENABLED ? state.spoutDur : 0;
+      if (spout && SPOUT_ENABLED) {
+        state.spoutOn = true;
+        state.spout = 0;
+        state.spoutCfg = spoutCfg(Math.random());
+      }
+    },
+    setStyle(next) {
+      const style = next === 'fill' ? 'fill' : 'line';
+      if (style === state.style) return;
+      state.style = style;
+      applyStyle();
+    },
+    feed() {
+      if (state.play) return;   // 消遣模式里不播一轮结束的捕食
+      if (state.feeding) return;
+      state.feeding = true;
+      state.feed = 0;
+    },
+    setPlay(on) {
+      on = !!on;
+      if (on === state.play) return;
+      state.play = on;
+      state.snack = null;
+      state.playJump = null;
+      state.playSplash = null;
+      state.burst = null;
+      state.playSpawnIn = 0.9;
+      if (on && state.mode !== 'idle') {
+        state.prevMode = state.mode;
+        state.mode = 'idle';
+        state.blend = 0;
+        state.blendDelay = 0;
+        if (SPOUT_ENABLED) {
+          state.spoutOn = true;
+          state.spout = 0;
+          state.spoutCfg = spoutCfg(Math.random());
+        }
+      }
+    },
+    playClick() {
+      if (!state.play || state.playJump) return false;
+      state.playJump = { t: 0, takeoff: false, judged: false };
+      return true;
+    },
+    setSnackSpeed(units) {
+      const n = Number(units);
+      if (Number.isFinite(n) && n > 0) state.snackSpeed = Math.max(4, Math.min(60, n));
+    },
+    get play() { return state.play; },
+    get debug() { return DEBUG_HOOKS ? state : null; },
+    get mode() { return state.mode; },
+    rebuild: build,
+  };
+}
+
+function WhaleStrip({ useSession, useChat, useProjection, sessionId }) {
+  const hostRef = useRef(null);
+  const stageRef = useRef(null);
+  const svgRef = useRef(null);
+  const engineRef = useRef(null);
+  const settings = useSettings();
+  const scale = settings.whaleScale;
+  const whaleStyle = settings.whaleStyle === 'fill' ? 'fill' : 'line';
+  const playActive = useSyncExternalStore(subscribePlay, getPlayActive, getPlayActive);
+  const lastUsageRef = useRef(null);
+
+  // running：host 推来的忙闲位；partial / runningCalls：Chat 快照里互斥的两半
+  const running = useSession ? useSession((s) => !!s.running) : false;
+  const sessionFromStore = useSession ? useSession((s) => (s && s.id) || '') : '';
+  const sessionKey = sessionId || sessionFromStore || 'active';
+  ACTIVE_SESSION_ID = sessionKey;
+  const streaming = useChat
+    ? useChat((c) => !!(c && c.legacy && c.legacy.partial))
+    : (useSession ? useSession((s) => !!(s && s.partial)) : false);
+  const toolCount = useChat
+    ? useChat((c) => (c && c.legacy && c.legacy.runningCalls ? c.legacy.runningCalls.length : 0))
+    : (useSession ? useSession((s) => (s && s.runningCalls ? s.runningCalls.length : 0)) : 0);
+
+  // 权限模式：完全权限 → 黑色主色调；其余（仅可查看 / 工作区内修改）保持蓝色
+  let presetId = '';
+  try {
+    const selection = useProjection ? useProjection('permissions') : undefined;
+    if (selection && typeof selection === 'object') presetId = String(selection.currentValue || '');
+  } catch { presetId = ''; }
+  const fullAccess = presetId === 'danger-full-access';
+  DIAG.permission = presetId || '(unknown)';
+  debug({ permission: DIAG.permission });
+
+  // 档位：用宿主的 modelSelection 投影（next 优先，回落到 lastUsed），不再靠界面文字猜
+  let modelId = '';
+  try {
+    const sel = useProjection ? useProjection('modelSelection') : undefined;
+    if (sel && typeof sel === 'object') {
+      const pick = sel.next || sel.lastUsed || null;
+      modelId = String((pick && pick.model) || '');
+    }
+  } catch { modelId = ''; }
+  CURRENT_MODEL_ID = modelId;
+  DIAG.model = modelId || '(unknown)';
+
+  let usage = null;
+  try { usage = useProjection ? useProjection('tokenUsage') : null; } catch { usage = null; }
+  // usage 没换就不要重算：每次重渲染都重算会连带触发用量面板的 DOM 扫描
+  if (usage && usage !== lastUsageRef.current) {
+    lastUsageRef.current = usage;
+    setLatestUsage(sessionKey, usage);
+    try { updateCostState(usage); } catch (error) { DIAG.costError = String((error && error.message) || error); }
+    try {
+      DIAG.hookUsageAt = Date.now();
+      DIAG.hookUsage = [Number(usage.uncachedInputTokens || 0), Number(usage.cacheReadTokens || 0), Number(usage.outputTokens || 0)];
+      recordSessionUsage(sessionKey, usage);
+      DIAG.sessionKey = sessionKey;
+      DIAG.todayCost = todayCost();
+      DIAG.todayKey = beijingParts().date;
+      DIAG.todayDays = Object.keys(costStore.days).length;
+    } catch (e) { DIAG.todayError = String((e && e.message) || e); }
+  }
+
+  const target = running ? (streaming || toolCount > 0 ? 'working' : 'thinking') : 'idle';
+  const targetRef = useRef(target);
+  targetRef.current = target;
+
+  // 把所在的行（composer dock）改成 flex 横排：鲸鱼固定窄条在左，统计靠右且不截断。
+  // 统计条目可能比我晚挂载，所以持续校正（interval + ResizeObserver），而不是只跑一次。
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return undefined;
+    const touched = new Map();
+
+    const apply = () => {
+      let row = host.parentElement;
+      let hops = 0;
+      while (row && row.childElementCount < 2 && hops < 3) { row = row.parentElement; hops += 1; }
+      if (!row) return;
+      if (!touched.has(row)) {
+        touched.set(row, {
+          display: row.style.display, alignItems: row.style.alignItems, gap: row.style.gap,
+        });
+      }
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '12px';
+      Array.from(row.children).forEach((child) => {
+        if (child === host || child.contains(host)) return;
+        child.style.flex = '0 0 auto';
+        child.style.minWidth = '';
+        child.style.overflow = '';
+        if (child.style.marginLeft === 'auto') child.style.marginLeft = '';
+      });
+      // 关键：给状态条 margin-right:auto，把剩余空间全部推给右侧统计，
+      // 状态条因此永远贴住行左边缘；首轮后统计变宽也不会把它挤走。
+      host.style.position = '';
+      host.style.flex = '0 0 232px';
+      host.style.width = '232px';
+      host.style.minWidth = '232px';
+      host.style.maxWidth = '232px';
+      host.style.marginRight = 'auto';
+      host.style.marginLeft = '0px';
+    };
+
+    apply();
+    const timer = setInterval(apply, 400);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(apply) : null;
+    if (ro) ro.observe(host);
+
+    return () => {
+      clearInterval(timer);
+      if (ro) ro.disconnect();
+      touched.forEach((prev, row) => {
+        row.style.display = prev.display;
+        row.style.alignItems = prev.alignItems;
+        row.style.gap = prev.gap;
+      });
+    };
+  }, [scale]);
+
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return undefined;
+    const engine = createEngine(svg, { onSnack: recordSnackEaten });
+    engineRef.current = engine;
+    engine.build();
+    engine.setMode(targetRef.current, { spout: false });
+    engine.setSnackSpeed(SNACK_BASE_SPEED * (readSettings().snackSpeed || 1));
+    engine.start();
+
+    let lastWidth = hostRef.current ? hostRef.current.clientWidth : 0;
+    let resizeTimer = 0;
+    const ro = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => {
+        const host = hostRef.current;
+        if (!host) return;
+        const width = host.clientWidth;
+        // 统计文字会不停变宽变窄：只同步宽度，绝不重建（重建会让鲸鱼跳一下）
+        if (Math.abs(width - lastWidth) < 2) return;
+        lastWidth = width;
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => engine.resize(), 120);
+      })
+      : null;
+    if (ro && hostRef.current) ro.observe(hostRef.current);
+
+    return () => {
+      clearTimeout(resizeTimer);
+      if (ro) ro.disconnect();
+      engine.stop();
+      engineRef.current = null;
+    };
+  }, []);
+
+  // 风格 → 引擎（切换不重建，鲸鱼不跳）
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (engine) engine.setStyle(whaleStyle);
+  }, [whaleStyle]);
+
+  // 状态 → 引擎（消遣模式接管期间不切状态）
+  const prevRunning = useRef(running);
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    if (playActive) return;
+    engine.setMode(target);
+    if (prevRunning.current && !running) engine.feed();
+    prevRunning.current = running;
+  }, [target, running, playActive]);
+
+  // 消遣开关 → 引擎
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    engine.setPlay(playActive);
+    if (!playActive) engine.setMode(targetRef.current);
+  }, [playActive]);
+
+  // 零食速度 → 引擎
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (engine) engine.setSnackSpeed(SNACK_BASE_SPEED * (settings.snackSpeed || 1));
+  }, [settings.snackSpeed]);
+
+  const onStripClick = () => {
+    if (!playState.active) return;
+    playTouch();
+    const engine = engineRef.current;
+    if (engine) engine.playClick();
+  };
+
+  return h('div', {
+    ref: hostRef,
+    onClick: onStripClick,
+    role: playActive ? 'button' : undefined,
+    'aria-label': playActive ? '点击鲸鱼跃起接零食' : undefined,
+    title: playActive ? '点一下，鲸鱼会跳到固定落点接零食' : undefined,
+    style: {
+      flex: '0 0 232px', width: 232, height: 36 * scale, display: 'flex',
+      cursor: playActive ? 'pointer' : 'default',
+    },
+  }, h('svg', {
+    ref: svgRef,
+    viewBox: '0 0 560 44',
+    preserveAspectRatio: 'xMinYMid meet',
+    'aria-hidden': true,
+    style: {
+      display: 'block', width: '100%', height: '100%', overflow: 'visible',
+      color: fullAccess
+        ? 'var(--dsw-alias-label-primary, #111418)'
+        : 'var(--dsw-alias-state-business-primary, #4D6BFE)',
+      transition: 'color .25s ease',
+    },
+  }));
+}
+
+/* --------------------------------------------------------- 3：设置面板 */
+
+const SETTING_ROW = {
+  display: 'flex', alignItems: 'center', gap: 16, padding: '12px 2px',
+};
+
+function SettingText({ title, desc }) {
+  return h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+    h('div', { style: { fontSize: 13, color: 'var(--dsw-alias-label-primary, #1b1f26)' } }, title),
+    desc ? h('div', {
+      style: { fontSize: 12, marginTop: 2, color: 'var(--dsw-alias-label-tertiary, #9aa1ad)' },
+    }, desc) : null);
+}
+
+function SegButton({ active, children, onClick }) {
+  return h('button', {
+    type: 'button',
+    onClick,
+    style: {
+      padding: '4px 12px', borderRadius: 8, cursor: 'pointer', fontSize: 12.5,
+      border: '1px solid ' + (active ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'var(--dsw-alias-border-l1, #e7e9ee)'),
+      background: active ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'transparent',
+      color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #5c6270)',
+    },
+  }, children);
+}
+
+function ResetLedgerRow() {
+  const [done, setDone] = useState(false);
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, {
+      title: '重置消耗账本',
+      desc: '清空各会话的峰/谷分桶、基线与今日累计。清空后「历史」部分不再计入，'
+        + '只从此刻起记录并按峰谷分开计价',
+    }),
+    h('button', {
+      type: 'button',
+      onClick: () => { resetCostStore(); setDone(true); },
+      style: {
+        flex: '0 0 auto', fontSize: 12, padding: '4px 12px', borderRadius: 8, cursor: 'pointer',
+        border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+        background: 'transparent', color: 'inherit',
+      },
+    }, done ? '已重置' : '重置'));
+}
+
+function SnackSpeedRow({ value }) {
+  const mult = Number(value) || 1;
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, {
+      title: SETTINGS_SCHEMA.snackSpeed.label,
+      desc: SETTINGS_SCHEMA.snackSpeed.desc,
+    }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flex: '0 0 auto' } },
+      h('input', {
+        type: 'range', min: 0.5, max: 2, step: 0.1,
+        'aria-label': '零食速度',
+        value: mult,
+        onChange: (ev) => setSetting('snackSpeed', ev.target.value),
+        style: { width: 140, accentColor: 'var(--dsw-alias-state-business-primary, #4D6BFE)' },
+      }),
+      h('span', {
+        style: {
+          width: 42, textAlign: 'right', fontSize: 12.5, fontVariantNumeric: 'tabular-nums',
+          color: 'var(--dsw-alias-label-secondary, #5c6270)',
+        },
+      }, mult.toFixed(1) + '×')));
+}
+
+function WhaleScaleRow() {
+  const settings = useSettings();
+  const meta = SETTINGS_SCHEMA.whaleScale;
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, { title: meta.label, desc: meta.desc }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flex: '0 0 auto' } },
+      h('input', {
+        type: 'range', min: 0.7, max: 1.4, step: 0.05,
+        'aria-label': '鲸鱼缩放',
+        value: settings.whaleScale,
+        onChange: (ev) => setSetting('whaleScale', ev.target.value),
+        style: { width: 140, accentColor: 'var(--dsw-alias-state-business-primary, #4D6BFE)' },
+      }),
+      h('span', {
+        style: {
+          width: 42, textAlign: 'right', fontSize: 12.5,
+          fontVariantNumeric: 'tabular-nums',
+          color: 'var(--dsw-alias-label-secondary, #5c6270)',
+        },
+      }, Math.round(settings.whaleScale * 100) + '%')));
+}
+
+/* ---------------------------------------------- 设置分区：余额与用量 */
+
+const USAGE_URL = 'https://platform.deepseek.com/usage';
+
+function OfficialStatusRow() {
+  const [tick, setTick] = useState(0);
+  const status = peakStatus();
+  const checked = officialCheck;
+  const failed = checked.at > 0 && checked.ok === false;
+  const label = status.peak
+    ? '峰时（9–12 / 14–18）'
+    : status.reason === 'weekend' ? '谷时 · 周末'
+      : status.reason === 'holiday' ? '谷时 · 法定节假日'
+        : '谷时';
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, {
+      title: '峰谷与数据校验',
+      desc: '当前 ' + label + '；谷时鲸鱼海面会高亮一段绿色。每日校验一次官方定价页，连不上时粮仓图标右上角显示红点',
+    }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flex: '0 0 auto' } },
+      h('span', {
+        style: {
+          fontSize: 12, color: failed
+            ? 'var(--dsw-alias-state-warn-primary, #F59E0B)'
+            : 'var(--dsw-alias-label-tertiary, #9aa1ad)',
+        },
+      }, checked.at === 0 ? '尚未校验' : failed ? '官方页连接失败' : '官方页正常'),
+      h('button', {
+        type: 'button',
+        onClick: async () => {
+          await ensureOfficialCheck(true);
+          setTick((n) => n + 1);
+          applyToneAll();
+        },
+        style: {
+          fontSize: 12, padding: '4px 10px', borderRadius: 8, cursor: 'pointer',
+          border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+          background: 'transparent', color: 'inherit',
+        },
+      }, tick >= 0 ? '立即校验' : '立即校验')));
+}
+
+function DiagnosticsToggleRow({ value }) {
+  const enabled = value !== false;
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, { title: '弹层显示诊断信息', desc: '关闭后粮仓弹层里不再显示「复制诊断」按钮与诊断文本' }),
+    h('button', {
+      type: 'button',
+      role: 'switch',
+      'aria-label': '弹层显示诊断信息',
+      'aria-checked': enabled ? 'true' : 'false',
+      onClick: () => setSetting('showDiagnostics', !enabled),
+      style: {
+        flex: '0 0 auto', width: 40, height: 22, borderRadius: 999, padding: 0, cursor: 'pointer',
+        border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+        background: enabled ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'transparent',
+        position: 'relative', transition: 'background .18s ease',
+      },
+    }, h('span', {
+      style: {
+        position: 'absolute', top: 2, left: enabled ? 20 : 2, width: 16, height: 16, borderRadius: '50%',
+        background: enabled ? '#fff' : 'var(--dsw-alias-label-tertiary, #9aa1ad)',
+        transition: 'left .18s ease',
+      },
+    })));
+}
+
+function WhaleStyleRow({ value }) {
+  const current = value === 'fill' ? 'fill' : 'line';
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, {
+      title: '鲸鱼风格',
+      desc: '线稿：只描边，能看到背后的海水；填色：实心鲸鱼，腹部与眼睛用底色留白（蓝白 / 黑白随主题）',
+    }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto' } },
+      h('button', {
+        type: 'button',
+        'aria-pressed': current === 'line' ? 'true' : 'false',
+        onClick: () => setSetting('whaleStyle', 'line'),
+        style: {
+          padding: '4px 12px', borderRadius: 8, cursor: 'pointer', fontSize: 12.5,
+          border: '1px solid ' + (current === 'line' ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'var(--dsw-alias-border-l1, #e7e9ee)'),
+          background: current === 'line' ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'transparent',
+          color: current === 'line' ? '#fff' : 'var(--dsw-alias-label-secondary, #5c6270)',
+        },
+      }, '线稿'),
+      h('button', {
+        type: 'button',
+        'aria-pressed': current === 'fill' ? 'true' : 'false',
+        onClick: () => setSetting('whaleStyle', 'fill'),
+        style: {
+          padding: '4px 12px', borderRadius: 8, cursor: 'pointer', fontSize: 12.5,
+          border: '1px solid ' + (current === 'fill' ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'var(--dsw-alias-border-l1, #e7e9ee)'),
+          background: current === 'fill' ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : 'transparent',
+          color: current === 'fill' ? '#fff' : 'var(--dsw-alias-label-secondary, #5c6270)',
+        },
+      }, '填色')));
+}
+
+function GreenBrightnessRow({ value }) {
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, { title: '绿色亮度', desc: '谷时高亮那一段绿色的明度；越高越亮，代价是对比度下降' }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flex: '0 0 auto' } },
+      h('input', {
+        type: 'range', min: 0.6, max: 2.4, step: 0.05, value,
+        'aria-label': '绿色亮度',
+        'aria-valuetext': Math.round(Number(value) * 100) + '%',
+        onChange: (ev) => setSetting('greenBrightness', ev.target.value),
+        style: { width: 140, accentColor: '#22c55e' },
+      }),
+      h('span', {
+        style: {
+          width: 44, textAlign: 'right', fontSize: 12.5, fontVariantNumeric: 'tabular-nums',
+          color: 'var(--dsw-alias-label-secondary, #5c6270)',
+        },
+      }, Math.round(Number(value) * 100) + '%')));
+}
+
+function AlertThresholdRow({ value }) {
+  const [draft, setDraft] = useState(String(value));
+  const editing = useRef(false);
+
+  useEffect(() => {
+    if (!editing.current) setDraft(String(value));
+  }, [value]);
+
+  const commit = (raw) => {
+    const n = Number(raw);
+    const next = Number.isFinite(n) && n >= 0 ? Math.min(10000, Math.round(n * 100) / 100) : value;
+    setDraft(String(next));
+    setSetting('alertThreshold', next);
+  };
+  const step = (delta) => {
+    const base = Number(draft);
+    commit(String((Number.isFinite(base) ? base : value) + delta));
+  };
+
+  const btnStyle = {
+    width: 26, height: 26, borderRadius: 8, cursor: 'pointer', fontSize: 14, lineHeight: '1',
+    border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+    background: 'transparent', color: 'inherit',
+  };
+
+  return h('div', { style: SETTING_ROW },
+    h(SettingText, { title: '余额预警', desc: '总余额低于该金额时粮仓图标变橙；填 0 关闭' }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' } },
+      h('button', { type: 'button', style: btnStyle, onClick: () => step(-1), title: '减 1 元' }, '−'),
+      h('input', {
+        type: 'number', min: 0, max: 10000, step: 0.5,
+        'aria-label': '余额预警金额（元）',
+        value: draft,
+        onFocus: () => { editing.current = true; },
+        onBlur: (ev) => { editing.current = false; commit(ev.target.value); },
+        onChange: (ev) => setDraft(ev.target.value),
+        onKeyDown: (ev) => {
+          if (ev.key === 'Enter') { ev.currentTarget.blur(); }
+          if (ev.key === 'Escape') { editing.current = false; setDraft(String(value)); ev.currentTarget.blur(); }
+        },
+        style: {
+          width: 78, padding: '4px 8px', borderRadius: 8, textAlign: 'right',
+          border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+          background: 'transparent', color: 'inherit', fontSize: 13,
+          fontVariantNumeric: 'tabular-nums',
+        },
+      }),
+      h('button', { type: 'button', style: btnStyle, onClick: () => step(1), title: '加 1 元' }, '+'),
+      h('span', { style: { fontSize: 12.5, color: 'var(--dsw-alias-label-tertiary, #9aa1ad)' } }, '元')),
+  );
+}
+
+function BalanceSection() {
+  const settings = useSettings();
+  // 与粮仓弹层共用一个真相：任一边刷新，两边同时变
+  const state = useSyncExternalStore(subscribeBalance, getBalanceSnapshot, getBalanceSnapshot);
+
+  useEffect(() => {
+    fetchBalance();
+    const timer = setInterval(() => { fetchBalance(); }, 30000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const ready = state.status === 'ready';
+  const normal = sumWallets(state.normal || []);
+  const bonus = sumWallets(state.bonus || []);
+  const total = sumWallets((state.normal || []).concat(state.bonus || []));
+
+  const line = (label, value) => h('div', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: 12, padding: '10px 2px',
+      fontSize: 13, color: 'var(--dsw-alias-label-primary, #1b1f26)',
+    },
+  },
+  h('span', { style: { color: 'var(--dsw-alias-label-secondary, #5c6270)' } }, label),
+  h('span', { style: { marginLeft: 'auto', fontWeight: 600, fontVariantNumeric: 'tabular-nums' } }, value));
+
+  return h('div', { style: { display: 'flex', flexDirection: 'column', padding: '4px 0 8px' } },
+    h(SettingText, {
+      title: '账户余额',
+      desc: '实时读取宿主账户接口（打开本页刷新）',
+    }),
+    h(AlertThresholdRow, { value: settings.alertThreshold }),
+    h(OfficialStatusRow),
+    h(WhaleStyleRow, { value: settings.whaleStyle }),
+    h(GreenBrightnessRow, { value: settings.greenBrightness }),
+    h(DiagnosticsToggleRow, { value: settings.showDiagnostics }),
+    h(WhaleScaleRow),
+    h(SnackSpeedRow, { value: settings.snackSpeed }),
+    h(ResetLedgerRow),
+    h('div', { style: SETTING_ROW },
+      h(SettingText, {
+        title: '重载界面',
+        desc: '改完插件不想重启 DSH 时点这里（等同刷新页面，会重新加载插件 bundle）',
+      }),
+      h('button', {
+        type: 'button',
+        onClick: () => { try { window.location.reload(); } catch { /* ignore */ } },
+        style: {
+          flex: '0 0 auto', fontSize: 12, padding: '4px 12px', borderRadius: 8, cursor: 'pointer',
+          border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+          background: 'transparent', color: 'inherit',
+        },
+      }, '重载')),
+    line('充值余额', ready ? formatMoney(normal) : '—'),
+    bonus.reduce((sum, w) => sum + w.amount, 0) > 0 || !ready
+      ? line('赠送余额', ready ? formatMoney(bonus) : '—') : null,
+    line('合计余额', ready ? formatMoney(total) : '—'),
+    h('a', {
+      href: USAGE_URL,
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      style: {
+        display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, padding: '10px 12px',
+        borderRadius: 10, textDecoration: 'none', color: 'inherit', fontSize: 13,
+        border: '1px solid var(--dsw-alias-border-l1, #e7e9ee)',
+        background: 'var(--dsw-alias-bg-l2, transparent)',
+      },
+    },
+      h('span', { style: { color: 'var(--dsw-alias-state-business-primary, #4D6BFE)', display: 'flex' } },
+        h(Icon, { name: 'bowl-spent', size: 18 })),
+      h('span', null, '查看用量明细 · platform.deepseek.com'),
+      h('span', { style: { marginLeft: 'auto', opacity: 0.55 } }, '↗')),
+    h('div', {
+      style: { marginTop: 8, fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #9aa1ad)' },
+    }, '余额来自宿主账户接口；消费与明细在平台网页，插件无法读取该页数据。'));
+}
+
+/* ------------------------------------------------- 定时发送（合并自 timed-send） */
+
+const timedSend = (() => {
+  const NS = 'timedSend';
+  const WITHDRAW_EVENT = 'dsh-plugin-whale:withdraw-draft';
+  const STORAGE_KEY = 'dsh-plugin-timed-send:pending:v1';
+  const CLIENT_TZ = (() => {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; }
+  })();
+
+  /* ------------------------------------------------------------------ 文案 */
+
+  const zh = {
+    'trigger.aria': '定时发送',
+    'panel.title': '定时发送',
+    'panel.today': '今天',
+    'panel.tomorrow': '明天',
+    'panel.hour': '小时',
+    'panel.minute': '分钟',
+    'panel.confirm': '定时发送',
+    'panel.hint': '到点后作为普通消息发出',
+    'panel.emptyDraft': '先在输入框写内容',
+    'panel.attachments': '暂不支持带附件的消息',
+    'chip.at': '{day} {clock}',
+    'chip.left': '还剩 {time}',
+    'chip.cancel': '取消',
+    'chip.editHint': '点击改时间 · 双击撤回重新编辑',
+    'panel.update': '改时间',
+    'chip.failed': '发送失败，点击重试',
+    'chip.seconds': '{n} 秒',
+    'chip.minutes': '{n} 分',
+    'chip.hours': '{n} 小时',
+    'chip.hoursMinutes': '{h} 小时 {m} 分',
+  };
+
+  const en = {
+    'trigger.aria': 'Send at a time',
+    'panel.title': 'Timed send',
+    'panel.today': 'Today',
+    'panel.tomorrow': 'Tomorrow',
+    'panel.hour': 'Hour',
+    'panel.minute': 'Minute',
+    'panel.confirm': 'Schedule',
+    'panel.hint': 'Delivered as a normal message',
+    'panel.emptyDraft': 'Write a message first',
+    'panel.attachments': 'Attachments are not supported yet',
+    'chip.at': '{day} {clock}',
+    'chip.left': 'in {time}',
+    'chip.cancel': 'Cancel',
+    'chip.editHint': 'Click to change time · Double-click to withdraw',
+    'panel.update': 'Update time',
+    'chip.failed': 'Send failed, click to retry',
+    'chip.seconds': '{n}s',
+    'chip.minutes': '{n}m',
+    'chip.hours': '{n}h',
+    'chip.hoursMinutes': '{h}h {m}m',
+  };
+
+  /* -------------------------------------------------------------- 样式 */
+
+  const CSS = `
+    .dts-trigger {
+      width: 28px; height: 28px; flex: none; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 0; border-radius: 9px; background: transparent; cursor: pointer;
+      color: var(--dsw-alias-label-secondary, #6b7280);
+      transition: background-color .12s, color .12s;
+    }
+    .dts-trigger:hover {
+      background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.05));
+      color: var(--dsw-alias-label-primary, #111827);
+    }
+    .dts-trigger { position: relative; }
+    .dts-trigger[data-armed="true"] { color: var(--dsw-alias-brand-primary, #4D6BFE); }
+    .dts-trigger[data-armed="true"]::after {
+      content: ""; position: absolute; right: 3px; top: 3px;
+      width: 5px; height: 5px; border-radius: 50%;
+      background: var(--dsw-alias-brand-primary, #4D6BFE);
+    }
+    .dts-trigger:disabled { opacity: .45; cursor: default; }
+
+    .dts-panel {
+      position: fixed; z-index: 1100; box-sizing: border-box;
+      width: 236px; padding: 10px;
+      border-radius: 14px;
+      background: var(--dsw-alias-bg-overlay, #ffffff);
+      border: 1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.08));
+      box-shadow: 0 14px 34px rgba(0,0,0,.16);
+      color: var(--dsw-alias-label-primary, #111827);
+      font: var(--dsw-font-xxs-12, 12px/1.5 system-ui);
+    }
+    .dts-head { display: flex; align-items: baseline; gap: 6px; padding: 2px 4px 8px; }
+    .dts-title { font-size: 13px; font-weight: 500; color: var(--dsw-alias-label-primary, #111827); }
+    .dts-target { margin-left: auto; font-size: 12px; color: var(--dsw-alias-brand-primary, #4D6BFE); font-variant-numeric: tabular-nums; }
+    .dts-cols { display: flex; gap: 6px; height: 168px; }
+    .dts-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    .dts-col-label { font-size: 11px; color: var(--dsw-alias-label-secondary, #9aa1ad); padding: 0 0 4px 6px; }
+    .dts-col-list {
+      flex: 1; overflow: auto; overscroll-behavior: contain;
+      display: flex; flex-direction: column; gap: 2px; padding-right: 2px;
+      scrollbar-width: thin;
+    }
+    .dts-opt {
+      flex: none; height: 30px; border: 0; border-radius: 8px; cursor: pointer;
+      background: transparent; color: var(--dsw-alias-label-primary, #111827);
+      font: inherit; font-size: 13px; font-variant-numeric: tabular-nums;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .dts-opt:hover { background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.05)); }
+    .dts-opt[data-selected="true"] {
+      background: var(--dsw-alias-brand-primary, #4D6BFE);
+      color: #fff;
+    }
+    .dts-foot { padding-top: 10px; }
+    .dts-hint { font-size: 11px; line-height: 1.4; color: var(--dsw-alias-label-secondary, #9aa1ad); padding: 0 4px 8px; }
+    .dts-confirm {
+      width: 100%; height: 32px; border: 0; border-radius: 9px; cursor: pointer;
+      background: var(--dsw-alias-brand-primary, #4D6BFE); color: #fff;
+      font: inherit; font-size: 13px; font-weight: 500;
+    }
+    .dts-confirm:hover { filter: brightness(1.05); }
+    .dts-confirm:disabled { opacity: .45; cursor: default; filter: none; }
+
+    /* 等待区卡片：与输入框卡片同宽、同右边缘，贴在它上方；宿主队列卡片出现时整行随之上移。 */
+    /* 吸附在输入框卡片顶部：上圆角、无底边，负的下边距让卡片顶边压住自己一截。 */
+    /* 高度 0：卡片绝对定位浮在上面，不占布局，对话区不会被顶上去。 */
+    .dts-wait {
+      box-sizing: border-box;
+      width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
+      max-width: var(--dsh-composer-card-max-width, 100%);
+      height: 0;
+      /* 抵掉多出来的一份 flex 间距，输入框位置保持不变。 */
+      margin: 0 auto calc(0px - var(--dsh-composer-stack-gap, 6px));
+      padding: 0;
+      position: relative;
+      z-index: 0;
+    }
+    .dts-wait-card {
+      position: absolute;
+      right: 0;
+      /* 底边仍压进对话框 8px + 21px，观感和上一版一致。 */
+      bottom: calc(0px - var(--dsh-composer-dock-inset, 8px) - 21px);
+      max-width: 100%;
+      min-width: 188px;
+      /* 上圆角、下方角；下沿被对话框压住，露出的是一条插上去的卡舌。 */
+      /* 上边缘两个圆角取面板半径的一半。 */
+      border-radius: calc(var(--dsw-radius-panel, 16px) * 0.5) calc(var(--dsw-radius-panel, 16px) * 0.5) 0 0;
+      background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-1, #fff));
+      border: .5px solid var(--dsw-alias-border-l1, rgba(0,0,0,.08));
+      padding: 2px 0 calc(10px + 21px);
+    }
+    .dts-wait-row {
+      display: flex; align-items: center; gap: 8px;
+      height: 34px; padding: 0 6px 0 12px;
+      color: var(--dsw-alias-label-primary, #111827);
+      font-size: 13px; font-variant-numeric: tabular-nums;
+    }
+    .dts-wait-row + .dts-wait-row { box-shadow: inset 0 1px 0 var(--dsw-alias-border-l1, rgba(0,0,0,.06)); }
+    .dts-wait-text {
+      flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      cursor: pointer; user-select: none;
+    }
+    .dts-wait-text[data-failed="true"] { color: var(--dsw-alias-state-error-primary, #d93026); cursor: pointer; }
+    .dts-wait-action {
+      width: 28px; height: 28px; flex: none; padding: 0;
+      border: 0; border-radius: 999px; background: transparent;
+      color: var(--dsw-alias-label-tertiary, #9aa1ad); cursor: pointer;
+      display: grid; place-items: center; font-size: 15px; line-height: 1;
+    }
+    .dts-wait-action:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(0,0,0,.05)); }
+
+  `;
+
+  /* -------------------------------------------------------------- 图标 */
+
+  const SAND_REDUCED = (() => {
+    try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch { return false; }
+  })();
+
+  const SAND_DUR = '3.8s';
+  // 上沙堆：从满（贴住顶盖）逐渐缩到瓶颈的一条缝；
+  // 下沙堆：从底部的小沙堆逐渐长高、铺满整个下漏斗（填到瓶颈）。
+  const TOP_FULL = 'M7.8 3.5 L16.2 3.5 L16.2 6.4 L14.1 8.9 L12 11.3 L9.9 8.9 L7.8 6.4 Z';
+  const TOP_EMPTY = 'M11.6 11.3 L12.4 11.3 L12.3 11.36 L12.12 11.44 L12 11.5 L11.88 11.44 L11.7 11.36 Z';
+  const BOTTOM_EMPTY = 'M12 18.3 L11.1 18.7 L10.5 19 L10.2 19.5 L13.8 19.5 L13.5 19 L12.9 18.7 Z';
+  const BOTTOM_FULL = 'M12 11.7 L9.9 13.6 L7.8 16.6 L7.8 19.5 L16.2 19.5 L16.2 16.6 L14.1 13.6 Z';
+
+  function Hourglass({ size = 18, sand = false }) {
+    return h('svg', {
+      width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+      stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round',
+      'aria-hidden': true,
+      style: {
+        display: 'block',
+        color: sand ? 'var(--dsw-alias-state-business-primary, #4D6BFE)' : undefined,
+      },
+    },
+      sand ? h('g', null,
+        SAND_REDUCED ? null : h('animateTransform', {
+          attributeName: 'transform',
+          attributeType: 'XML',
+          type: 'rotate',
+          values: '0 12 12;0 12 12;180 12 12;180 12 12',
+          keyTimes: '0;0.86;0.94;1',
+          calcMode: 'spline',
+          keySplines: '0 0 1 1;0.45 0 0.2 1;0 0 1 1',
+          dur: SAND_DUR,
+          repeatCount: 'indefinite',
+        }),
+        h('g', { className: 'dts-sand' },
+          h('path', { d: TOP_FULL, fill: 'currentColor', stroke: 'none', opacity: 0.85 },
+            SAND_REDUCED ? null : h('animate', {
+              attributeName: 'd',
+              values: TOP_FULL + ';' + TOP_FULL + ';' + TOP_EMPTY + ';' + TOP_EMPTY,
+              keyTimes: '0;0.05;0.74;1',
+              dur: SAND_DUR,
+              repeatCount: 'indefinite',
+            })),
+          h('line', {
+            x1: 12, y1: 11.4, x2: 12, y2: 17.2,
+            stroke: 'currentColor', strokeWidth: 1.1, strokeLinecap: 'round', opacity: 0.95,
+          }, SAND_REDUCED ? null : h('animate', {
+            attributeName: 'opacity',
+            values: '1;1;0;0;1',
+            keyTimes: '0;0.74;0.78;0.98;1',
+            dur: SAND_DUR,
+            repeatCount: 'indefinite',
+          })),
+          h('path', { d: BOTTOM_EMPTY, fill: 'currentColor', stroke: 'none', opacity: 0.85 },
+            SAND_REDUCED ? null : h('animate', {
+              attributeName: 'd',
+              values: BOTTOM_EMPTY + ';' + BOTTOM_EMPTY + ';' + BOTTOM_FULL + ';' + BOTTOM_FULL,
+              keyTimes: '0;0.05;0.74;1',
+              dur: SAND_DUR,
+              repeatCount: 'indefinite',
+            })),
+        ),
+        h('path', { d: 'M6 3.5h12' }),
+        h('path', { d: 'M6 20.5h12' }),
+        h('path', { d: 'M7.8 3.5v2.9c0 1.5 4.2 3.1 4.2 5.1s-4.2 3.6-4.2 5.1v2.9' }),
+        h('path', { d: 'M16.2 3.5v2.9c0 1.5-4.2 3.1-4.2 5.1s4.2 3.6 4.2 5.1v2.9' }),
+      ) : [
+        h('path', { key: 'cap1', d: 'M6 3.5h12' }),
+        h('path', { key: 'cap2', d: 'M6 20.5h12' }),
+        h('path', { key: 'left', d: 'M7.8 3.5v2.9c0 1.5 4.2 3.1 4.2 5.1s-4.2 3.6-4.2 5.1v2.9' }),
+        h('path', { key: 'right', d: 'M16.2 3.5v2.9c0 1.5-4.2 3.1-4.2 5.1s4.2 3.6 4.2 5.1v2.9' }),
+      ],
+    );
+  }
+
+  /* ------------------------------------------------------------ 待发队列 */
+
+  let remoteRef = null;
+  let sessionNs = null;
+  let sessionsRef = null;
+  let clientCtx = null;
+  /* 等待卡片（input.dock）不一定会拿到 inputActions，从同一会话的沙漏按钮那里记一份 */
+  let lastInputActions = null;
+  let lastInputSession = null;
+
+  const store = { items: [], snapshot: [] };
+  const listeners = new Set();
+  const timers = new Map();
+
+  function readStorage() {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(list)) return [];
+      return list.filter((x) => x && typeof x.sessionId === 'string'
+        && typeof x.text === 'string' && Number.isFinite(x.at))
+        .map((x) => ({
+          id: typeof x.id === 'string' ? x.id : String(x.at),
+          sessionId: x.sessionId,
+          text: x.text,
+          at: x.at,
+          failed: x.failed === true,
+          error: typeof x.error === 'string' ? x.error : '',
+        }));
+    } catch { return []; }
+  }
+
+  function writeStorage() {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store.items));
+    } catch { /* 存不下就只保留内存态 */ }
+  }
+
+  function publish() {
+    store.snapshot = store.items.map((item) => ({ ...item }));
+    listeners.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+  }
+
+  function subscribe(fn) {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
+  }
+
+  function getSnapshot() {
+    return store.snapshot;
+  }
+
+  function clearTimer(id) {
+    const timer = timers.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timers.delete(id);
+    }
+  }
+
+  function arm(item) {
+    clearTimer(item.id);
+    if (item.failed) return;
+    const delay = Math.max(0, Math.min(item.at - Date.now(), 2 ** 30));
+    const timer = setTimeout(() => {
+      timers.delete(item.id);
+      fire(item.id);
+    }, delay);
+    timers.set(item.id, timer);
+  }
+
+  function armAll() {
+    store.items.forEach((item) => arm(item));
+  }
+
+  /** 页面休眠/聚焦回来时补一次：已经到点的立即投递。 */
+  function sweep() {
+    const now = Date.now();
+    store.items.filter((item) => !item.failed && item.at <= now).forEach((item) => fire(item.id));
+  }
+
+  function schedule(sessionId, text, at) {
+    const item = {
+      id: `ts-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      sessionId,
+      text,
+      at,
+      failed: false,
+      error: '',
+    };
+    store.items.push(item);
+    writeStorage();
+    arm(item);
+    publish();
+    return item;
+  }
+
+  function cancel(id) {
+    clearTimer(id);
+    store.items = store.items.filter((item) => item.id !== id);
+    writeStorage();
+    publish();
+  }
+  /** 改一条待发消息的发送时间（等待卡片里点时间区域）。 */
+  function reschedule(id, at) {
+    const item = store.items.find((entry) => entry.id === id);
+    if (!item) return;
+    clearTimer(id);
+    item.at = at;
+    item.failed = false;
+    item.error = '';
+    writeStorage();
+    arm(item);
+    publish();
+  }
+
+  /** Client 侧的 services：优先 ctx.sessions，其次 ctx.get('sessions')。 */
+  function resolveSessions() {
+    if (sessionsRef) return sessionsRef;
+    const ctx = clientCtx;
+    if (!ctx) return null;
+    try { if (ctx.sessions) return ctx.sessions; } catch { /* ignore */ }
+    try { return ctx.get ? ctx.get('sessions') : null; } catch { return null; }
+  }
+
+  /** 找到 Client 侧的 session Remote（`remote.session` 命名空间），找不到返回 null。 */
+  function resolveRemoteSession() {
+    if (sessionNs && typeof sessionNs.prompt === 'function') return sessionNs;
+    const ctx = clientCtx;
+    if (ctx) {
+      try { const ns = ctx['remote.session']; if (ns && typeof ns.prompt === 'function') return ns; } catch { /* ignore */ }
+      try { const ns = ctx.remote && ctx.remote.session; if (ns && typeof ns.prompt === 'function') return ns; } catch { /* ignore */ }
+    }
+    if (remoteRef && remoteRef.session && typeof remoteRef.session.prompt === 'function') return remoteRef.session;
+    return null;
+  }
+
+  function shortError(value) {
+    const text = value && value.message ? value.message : String(value || '');
+    return text.length > 60 ? `${text.slice(0, 57)}…` : text;
+  }
+
+  /**
+   * 把一条排队项投递进会话。试三条通路，全部失败时把每一步的原因拼起来，
+   * 由排队条显示出来（否则页面上只能看到一句「发送失败」）。
+   */
+  async function deliver(item) {
+    const content = [{ type: 'text', text: item.text }];
+    const attempted = [];
+
+    const remote = resolveRemoteSession();
+    if (remote && typeof remote.prompt === 'function') {
+      try {
+        const result = await remote.prompt({
+          requestId: `timed-${item.id}`,
+          sessionId: item.sessionId,
+          mode: 'queue',
+          content,
+          clientTimeZone: CLIENT_TZ,
+        }, new AbortController().signal);
+        if (!result || result.ok !== false) return;
+        attempted.push(`remote:${result.error ? result.error.code : 'rejected'}`);
+      } catch (error) {
+        attempted.push(`remote:${shortError(error)}`);
+      }
+    } else {
+      attempted.push('remote:unavailable');
+    }
+
+    const sessions = resolveSessions();
+    if (sessions && typeof sessions.binding === 'function') {
+      try {
+        const binding = sessions.binding(item.sessionId);
+        if (binding && binding.session && typeof binding.session.prompt === 'function') {
+          const result = await binding.session.prompt(content, 'queue');
+          if (!result || result.ok !== false) return;
+          attempted.push(`binding:${result.error ? result.error.code : 'rejected'}`);
+        } else {
+          attempted.push('binding:none');
+        }
+      } catch (error) {
+        attempted.push(`binding:${shortError(error)}`);
+      }
+    } else {
+      attempted.push('sessions:unavailable');
+    }
+
+    // 最后一条：借一次 Session 引用再发，冷会话也能唤醒。
+    if (sessions && typeof sessions.using === 'function') {
+      try {
+        await sessions.using({ sessionId: item.sessionId }, { source: 'timed-send' }, async (reference) => {
+          const target = reference && reference.binding && reference.binding.session;
+          if (!target || typeof target.prompt !== 'function') throw new Error('no session on reference');
+          const result = await target.prompt(content, 'queue');
+          if (result && result.ok === false) throw new Error(result.error ? result.error.code : 'rejected');
+        });
+        return;
+      } catch (error) {
+        attempted.push(`using:${shortError(error)}`);
+      }
+    }
+
+    throw new Error(attempted.join(' | '));
+  }
+
+  async function fire(id) {
+    const item = store.items.find((entry) => entry.id === id);
+    if (!item || item.failed) return;
+    clearTimer(id);
+    try {
+      await deliver(item);
+      cancel(id);
+    } catch (error) {
+      if (clientCtx) {
+        try { clientCtx.logger?.warn?.(`timed-send: ${String(error && error.message || error)}`); } catch { /* ignore */ }
+      }
+      const current = store.items.find((entry) => entry.id === id);
+      if (current) {
+        current.failed = true;
+        current.error = shortError(error);
+        writeStorage();
+        publish();
+      }
+    }
+  }
+
+  function retry(id) {
+    const item = store.items.find((entry) => entry.id === id);
+    if (!item) return;
+    if (item.at <= Date.now()) {
+      item.failed = false;
+      writeStorage();
+      publish();
+      fire(id);
+      return;
+    }
+    item.failed = false;
+    writeStorage();
+    publish();
+    arm(item);
+  }
+
+  /* ------------------------------------------------------------ 时间工具 */
+
+  function pad2(value) {
+    return String(value).padStart(2, '0');
+  }
+
+  /** 选定的「时、分」落到最近的一个未来时刻：今天已过就顺延到明天。 */
+  function nextOccurrence(hour, minute) {
+    const now = new Date();
+    const at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
+    if (at.getTime() <= now.getTime() + 2000) at.setDate(at.getDate() + 1);
+    return at.getTime();
+  }
+
+  function sameDay(a, b) {
+    return a.getFullYear() === b.getFullYear()
+      && a.getMonth() === b.getMonth()
+      && a.getDate() === b.getDate();
+  }
+
+  function dayLabel(ms, t) {
+    const date = new Date(ms);
+    const now = new Date();
+    if (sameDay(date, now)) return t('panel.today');
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    if (sameDay(date, tomorrow)) return t('panel.tomorrow');
+    return `${date.getMonth() + 1}/${date.getDate()}`;
+  }
+
+  function clockLabel(ms) {
+    const date = new Date(ms);
+    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  }
+
+  function remainLabel(ms, t) {
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    if (seconds < 60) return t('chip.seconds', { n: seconds });
+    const minutes = Math.max(1, Math.round(seconds / 60));
+    if (minutes < 60) return t('chip.minutes', { n: minutes });
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest === 0 ? t('chip.hours', { n: hours }) : t('chip.hoursMinutes', { h: hours, m: rest });
+  }
+
+  const fallbackText = (key) => key;
+  const asText = (value) => (typeof value === 'function' ? value : fallbackText);
+
+  const HOURS = Array.from({ length: 24 }, (_, i) => i);
+  const MINUTES = Array.from({ length: 60 }, (_, i) => i);
+
+  /* -------------------------------------------------------------- 组件 */
+
+  function ClockColumn({ label, options, value, onPick }) {
+    const listRef = useRef(null);
+    useEffect(() => {
+      const node = listRef.current;
+      if (!node) return;
+      const selected = node.querySelector('[data-selected="true"]');
+      if (selected && typeof selected.scrollIntoView === 'function') {
+        selected.scrollIntoView({ block: 'center' });
+      }
+    }, []);
+    return h('div', { className: 'dts-col' },
+      h('div', { className: 'dts-col-label' }, label),
+      h('div', { className: 'dts-col-list', role: 'listbox', 'aria-label': label, ref: listRef },
+        options.map((option) => h('button', {
+          key: option,
+          type: 'button',
+          role: 'option',
+          className: 'dts-opt',
+          'aria-selected': option === value,
+          'data-selected': option === value ? 'true' : 'false',
+          onClick: () => onPick(option),
+        }, pad2(option)))));
+  }
+
+  function TimePanel({ anchorRef, blockedReason, onCommit, onClose, hour, minute, setHour, setMinute, confirmText, t: tProp }) {
+    const t = asText(tProp);
+    const panelRef = useRef(null);
+    const [placement, setPlacement] = useState(null);
+
+    useEffect(() => {
+      const anchor = anchorRef.current;
+      if (!anchor) return;
+      const place = () => {
+        const rect = anchor.getBoundingClientRect();
+        setPlacement({
+          right: Math.max(12, window.innerWidth - rect.right),
+          bottom: Math.max(12, window.innerHeight - rect.top + 8),
+        });
+      };
+      place();
+      window.addEventListener('resize', place);
+      return () => window.removeEventListener('resize', place);
+    }, [anchorRef]);
+
+    useEffect(() => {
+      const onDown = (event) => {
+        const panel = panelRef.current;
+        const anchor = anchorRef.current;
+        if (panel && panel.contains(event.target)) return;
+        if (anchor && anchor.contains(event.target)) return;
+        onClose();
+      };
+      const onKey = (event) => {
+        if (event.key !== 'Escape') return;
+        event.stopPropagation();
+        onClose();
+      };
+      document.addEventListener('pointerdown', onDown, true);
+      document.addEventListener('keydown', onKey, true);
+      return () => {
+        document.removeEventListener('pointerdown', onDown, true);
+        document.removeEventListener('keydown', onKey, true);
+      };
+    }, [anchorRef, onClose]);
+
+    const target = nextOccurrence(hour, minute);
+    const style = placement === null
+      ? { visibility: 'hidden', right: 12, bottom: 120 }
+      : { right: placement.right, bottom: placement.bottom };
+
+    return ReactDOM.createPortal(h('div', {
+      ref: panelRef,
+      className: 'dts-panel',
+      style,
+      role: 'dialog',
+      'aria-label': t('panel.title'),
+    },
+      h('div', { className: 'dts-head' },
+        h('span', { className: 'dts-title' }, t('panel.title')),
+        h('span', { className: 'dts-target' }, `${dayLabel(target, t)} ${clockLabel(target)}`)),
+      h('div', { className: 'dts-cols' },
+        h(ClockColumn, { label: t('panel.hour'), options: HOURS, value: hour, onPick: setHour }),
+        h(ClockColumn, { label: t('panel.minute'), options: MINUTES, value: minute, onPick: setMinute })),
+      h('div', { className: 'dts-foot' },
+        h('div', { className: 'dts-hint' }, blockedReason || t('panel.hint')),
+        h('button', {
+          type: 'button',
+          className: 'dts-confirm',
+          disabled: blockedReason !== null,
+          onClick: onCommit,
+        }, confirmText || t('panel.confirm')))),
+    document.body);
+  }
+
+  function TimedSendButton({ useInput, inputActions, sessionId, t: tProp }) {
+    const t = asText(tProp);
+    if (inputActions) { lastInputActions = inputActions; lastInputSession = sessionId; }
+
+    useEffect(() => {
+      const onWithdraw = (event) => {
+        const detail = event && event.detail;
+        if (!detail || detail.sessionId !== sessionId) return;
+        try { if (inputActions) inputActions.setDraft(detail.text); } catch { /* ignore */ }
+      };
+      window.addEventListener(WITHDRAW_EVENT, onWithdraw);
+      return () => window.removeEventListener(WITHDRAW_EVENT, onWithdraw);
+    }, [sessionId, inputActions]);
+    const [open, setOpen] = useState(false);
+    const anchorRef = useRef(null);
+    const pending = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+      .filter((item) => item.sessionId === sessionId);
+
+    const initial = new Date(Date.now() + 5 * 60000);
+    const [hour, setHour] = useState(initial.getHours());
+    const [minute, setMinute] = useState(initial.getMinutes());
+
+    const draft = useInput ? useInput((state) => (state && typeof state.draft === 'string' ? state.draft : '')) : '';
+    const attachmentCount = useInput
+      ? useInput((state) => (state && Array.isArray(state.attachmentIds) ? state.attachmentIds.length : 0))
+      : 0;
+
+    const text = String(draft || '').trim();
+    const blockedReason = attachmentCount > 0
+      ? t('panel.attachments')
+      : (text === '' ? t('panel.emptyDraft') : null);
+
+    const commit = () => {
+      if (blockedReason !== null || !inputActions || !sessionId) return;
+      schedule(sessionId, text, nextOccurrence(hour, minute));
+      try { inputActions.setDraft(''); } catch { /* ignore */ }
+      setOpen(false);
+    };
+
+    const disabled = !sessionId;
+    const armed = pending.length > 0;
+
+    return h('div', { className: 'dts-root', style: { position: 'relative', display: 'inline-flex' } },
+      h('button', {
+        ref: anchorRef,
+        type: 'button',
+        className: 'dts-trigger',
+        title: t('trigger.aria'),
+        'aria-label': t('trigger.aria'),
+        'aria-haspopup': 'dialog',
+        'aria-expanded': open,
+        'data-armed': armed ? 'true' : 'false',
+        disabled,
+        onClick: () => setOpen((value) => !value),
+      }, h(Hourglass, { size: 18 })),
+      open && h(TimePanel, {
+        anchorRef,
+        blockedReason,
+        hour,
+        minute,
+        setHour,
+        setMinute,
+        onCommit: commit,
+        onClose: () => setOpen(false),
+        t,
+      }));
+  }
+
+  function PendingChips({ sessionId, inputActions, t: tProp }) {
+    const t = asText(tProp);
+    const all = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+    const [now, setNow] = useState(() => Date.now());
+    const [editing, setEditing] = useState(null);
+    const editAnchor = useRef(null);
+    const clickTimer = useRef(0);
+
+    useEffect(() => {
+      const timer = setInterval(() => setNow(Date.now()), 15000);
+      return () => clearInterval(timer);
+    }, []);
+
+    useEffect(() => () => {
+      if (clickTimer.current) clearTimeout(clickTimer.current);
+    }, []);
+
+    const items = all.filter((item) => item.sessionId === sessionId);
+    if (items.length === 0) return null;
+
+    const openEditor = (item, el) => {
+      const d = new Date(item.at);
+      editAnchor.current = el;
+      setEditing({ id: item.id, hour: d.getHours(), minute: d.getMinutes() });
+    };
+
+    const withdraw = (item) => {
+      cancel(item.id);
+      setEditing(null);
+      const actions = inputActions
+        || (lastInputSession === sessionId ? lastInputActions : null);
+      if (actions && typeof actions.setDraft === 'function') {
+        try { actions.setDraft(item.text); } catch { /* ignore */ }
+      }
+      try {
+        window.dispatchEvent(new CustomEvent(WITHDRAW_EVENT, {
+          detail: { sessionId, text: item.text },
+        }));
+      } catch { /* ignore */ }
+    };
+
+    const onTextClick = (item, el) => {
+      if (clickTimer.current) clearTimeout(clickTimer.current);
+      clickTimer.current = setTimeout(() => {
+        clickTimer.current = 0;
+        if (item.failed) retry(item.id); else openEditor(item, el);
+      }, 240);
+    };
+
+    const onTextDoubleClick = (item) => {
+      if (clickTimer.current) {
+        clearTimeout(clickTimer.current);
+        clickTimer.current = 0;
+      }
+      withdraw(item);
+    };
+
+    return h('div', { className: 'dts-wait' },
+      h('div', { className: 'dts-wait-card' }, items.map((item) => h('div', {
+        key: item.id,
+        className: 'dts-wait-row',
+      },
+        h(Hourglass, { size: 20, sand: true }),
+        h('span', {
+          className: 'dts-wait-text',
+          'data-failed': item.failed ? 'true' : 'false',
+          title: item.failed
+            ? `${item.error || ''}（双击撤回重新编辑）`
+            : t('chip.editHint'),
+          onClick: (ev) => onTextClick(item, ev.currentTarget),
+          onDoubleClick: () => onTextDoubleClick(item),
+        }, item.failed
+          ? `${t('chip.failed')}${item.error ? `（${item.error}）` : ''}`
+          : `${t('chip.at', { day: dayLabel(item.at, t), clock: clockLabel(item.at) })} · ${t('chip.left', { time: remainLabel(item.at - now, t) })}`),
+        h('button', {
+          type: 'button',
+          className: 'dts-wait-action',
+          'aria-label': t('chip.cancel'),
+          title: t('chip.cancel'),
+          onClick: () => cancel(item.id),
+        }, '×')))),
+      editing ? h(TimePanel, {
+        anchorRef: editAnchor,
+        blockedReason: null,
+        hour: editing.hour,
+        minute: editing.minute,
+        setHour: (hour) => setEditing((prev) => (prev ? { ...prev, hour } : prev)),
+        setMinute: (minute) => setEditing((prev) => (prev ? { ...prev, minute } : prev)),
+        onCommit: () => {
+          const at = nextOccurrence(editing.hour, editing.minute);
+          reschedule(editing.id, at);
+          setEditing(null);
+        },
+        onClose: () => setEditing(null),
+        confirmText: t('panel.update'),
+        t: tProp,
+      }) : null);
+  }
+
+  /** 把定时发送挂到 whale 的 ctx 上；返回清理函数，交给外层的 disposers。 */
+  function install(ctx) {
+    const cleanups = [];
+    clientCtx = ctx;
+
+    cleanups.push(ctx.locale.register(NS, { zh, en }));
+
+    const tag = document.createElement('style');
+    tag.dataset.plugin = 'dsh-plugin-whale/timed-send';
+    tag.textContent = CSS;
+    document.head.appendChild(tag);
+    cleanups.push(() => tag.remove());
+
+    try {
+      ctx.inject(['remote', 'remote.session'], (child) => {
+        const ns = child['remote.session'] || (child.remote && child.remote.session) || null;
+        if (ns) sessionNs = ns;
+        else remoteRef = child['remote'] || child.remote || null;
+      });
+    } catch { /* 没有 remote 时投递会在队列里报错 */ }
+    try { const ns = ctx['remote.session']; if (ns) sessionNs = ns; } catch { /* ignore */ }
+    try { ctx.inject(['sessions'], (child) => { if (child.sessions) sessionsRef = child.sessions; }); } catch { /* ignore */ }
+
+    store.items = readStorage();
+    publish();
+    armAll();
+
+    const onWake = () => sweep();
+    window.addEventListener('focus', onWake);
+    document.addEventListener('visibilitychange', onWake);
+    cleanups.push(() => {
+      window.removeEventListener('focus', onWake);
+      document.removeEventListener('visibilitychange', onWake);
+      timers.forEach((timer) => clearTimeout(timer));
+      timers.clear();
+    });
+
+    // 沙漏：模型选择器与发送键之间
+    cleanups.push(ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
+      name: 'conversation.input.right',
+      id: 'timed-send',
+      order: 10,
+      locale: NS,
+    }, TimedSendButton)));
+
+    // 等待卡片：输入框上方，绝对定位不占布局
+    cleanups.push(ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+      name: 'conversation.input.dock',
+      id: 'timed-send-chips',
+      order: 30,
+      locale: NS,
+    }, PendingChips)));
+
+    return () => cleanups.forEach((fn) => { try { if (typeof fn === 'function') fn(); } catch { /* ignore */ } });
+  }
+
+  return { install };
+})();
+
+/* ---------------------------------------------------------------- apply */
+
+const inject = ['slots', 'locale'];  // settingsScope 可选，缺失时设置项只读默认值
+
+function apply(ctx) {
+  clientCtx = ctx;
+  // HMR / 重载：先把上一轮挂的 DOM 与监听拆掉。否则下面「已挂载」的守卫会直接返回，
+  // 界面就会一直停在旧版本（这正是 Cmd+R 之后「页面毫无变化」的原因）。
+  try { if (typeof window.__dshWhaleDispose === 'function') window.__dshWhaleDispose(); } catch { /* ignore */ }
+  const disposers = [];
+  // 开发用：把状态条引擎单独挂到页面上（仅调试开关打开时）
+  if (DEBUG_HOOKS) try {
+    window.__dshWhaleMountDebug = (width, height) => {
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:0;top:0;width:' + (width || 560) + 'px;height:'
+        + (height || 36) + 'px;z-index:9999;background:#fff;color:#4D6BFE';
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.style.cssText = 'width:100%;height:100%;display:block';
+      host.appendChild(svg);
+      document.body.appendChild(host);
+      const engine = createEngine(svg);
+      engine.build();
+      engine.setMode('working', { spout: false });
+      engine.start();
+      return host;
+    };
+  } catch { /* ignore */ }
+  // 0.2 客户端：配置表单按 loader 条目 id 暴露；0.1 客户端退回 settingsScope。
+  // 两个服务都要用 ctx.inject 等就绪，直接读 ctx.xxx 在未注入时拿不到。
+  try {
+    ctx.inject(['configForms'], (child) => {
+      try {
+        bindScope(child.configForms && child.configForms.get
+          ? child.configForms.get('dsh-plugin-whale')
+          : null);
+      } catch { bindScope(null); }
+      debug({ configForms: true, scope: !!scope });
+    });
+  } catch { /* 旧宿主没有 configForms */ }
+
+  try {
+    ctx.inject(['settingsScope'], (child) => {
+      if (scope) return;
+      try { bindScope(child.settingsScope.bind({ namespace: 'dsh-plugin-whale' })); } catch { /* ignore */ }
+      debug({ settingsScope: true, scope: !!scope });
+    });
+  } catch { /* ignore */ }
+
+  try {
+    ctx.inject(['remote', 'remote.account'], (child) => {
+      injectedCtx = child;
+      let hasRemote = false;
+      let hasAccount = false;
+      try { hasRemote = !!child.remote; } catch { hasRemote = false; }
+      try { hasAccount = !!(child['remote.account'] || (child.remote && child.remote.account)); } catch { hasAccount = false; }
+      remote = hasRemote ? child.remote : remote;
+      debug({ remote: hasRemote, account: hasAccount });
+      DIAG.raw = 'injected remote=' + hasRemote + ' account=' + hasAccount;
+      try {
+        const snap = scope && scope.getSnapshot ? scope.getSnapshot() : null;
+        if (snap) debug({ scopeMode: snap.mode || null, writable: snap.writable });
+      } catch { /* ignore */ }
+      if (hasAccount) refreshBalanceTone();
+    });
+  } catch { /* 账户服务缺席（web 端） */ }
+
+  try { disposers.push(installCostRow()); } catch { /* ignore */ }
+  if (DEBUG_HOOKS) try {
+    window.__dshWhalePeakOverride = (v) => { PEAK_OVERRIDE = (v === 'peak' || v === 'valley') ? v : null; return PEAK_OVERRIDE; };
+  } catch { /* ignore */ }
+  if (DEBUG_HOOKS) try {
+    // 测试桩：单独挂一个真实引擎，驱动消遣模式并观察卡片统计（只在 debug=1 时存在）
+    window.__dshWhaleTestEngine = (width, height) => {
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:0;top:0;width:' + (width || 232) + 'px;height:'
+        + (height || 36) + 'px;z-index:9999;background:#fff;color:#4D6BFE';
+      document.body.appendChild(host);
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.style.cssText = 'width:100%;height:100%;display:block';
+      host.appendChild(svg);
+      const engine = createEngine(svg, { onSnack: recordSnackEaten });
+      engine.build();
+      engine.setSnackSpeed(SNACK_BASE_SPEED * readSettings().snackSpeed);
+      engine.start();
+      window.__dshWhaleEngine = engine;
+      return engine;
+    };
+    window.__dshWhalePlay = {
+      set: playSet,
+      get active() { return playState.active; },
+      get round() { return playRound; },
+      get best() { return snackStats.best; },
+    };
+  } catch { /* ignore */ }
+  if (DEBUG_HOOKS) try {
+    window.__dshWhaleSession = (id) => { ACTIVE_SESSION_ID = String(id || ''); return ACTIVE_SESSION_ID; };
+    window.__dshWhaleUsage = (usage) => {
+      recordSessionUsage(ACTIVE_SESSION_ID || 'probe', usage || { uncachedInputTokens: 100000, cacheReadTokens: 1000000, cacheWriteTokens: 0, outputTokens: 20000 });
+      return { today: todayCost(), store: costStore };
+    };
+    window.__dshWhaleSet = (key, value) => { setSetting(key, value); return readSettings(); };
+  } catch { /* ignore */ }
+  if (DEBUG_HOOKS) try {
+    window.__dshWhaleCost = (usage) => { updateCostState(usage || {
+      uncachedInputTokens: 1200, cacheReadTokens: 8800, cacheWriteTokens: 0, outputTokens: 320,
+    }); return COST_STATE; };
+  } catch { /* ignore */ }
+
+  // 1 号：侧边栏底部余额入口（原生 DOM，不进 React 树）
+  try { disposers.push(mountBalance() || (() => {})); } catch (error) { debug({ mountError: String(error && error.message) }); }
+
+  // 统一回收：HMR 会再次执行 apply，先把这一轮的 DOM 全部拆干净
+  window.__dshWhaleDispose = () => {
+    disposers.splice(0).forEach((fn) => { try { if (typeof fn === 'function') fn(); } catch { /* ignore */ } });
+  };
+  try {
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => () => {
+        try { if (window.__dshWhaleDispose) window.__dshWhaleDispose(); } catch { /* ignore */ }
+      }, 'dsh-plugin-whale: teardown');
+    }
+  } catch { /* ignore */ }
+
+  // 2 号：输入框下方鲸鱼状态条（排在同槽的统计信息之前）
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock',
+    id: 'whale-strip',
+    order: -10,
+  }, WhaleStrip));
+
+  // 3 号：定时发送（沙漏 + 等待卡片）
+  try { disposers.push(timedSend.install(ctx)); } catch (error) { debug({ timedSend: String(error && error.message) }); }
+
+  // 设置分区：余额与用量（账户页没有可插入的插槽，所以单独开一页，排在“账户”后面）
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'whale-usage',
+    order: -9,
+    label: () => '鲸鱼插件',
+  }, BalanceSection));
+
+}
+
+exports.apply = apply;
+exports.inject = inject;

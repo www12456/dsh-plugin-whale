@@ -1,0 +1,4 @@
+# dsh-plugin-whale 作为 bundle 层挂载的补丁：把插件本体插入 profile 的根条目。
+- insert:
+    - id: dsh-plugin-whale
+      name: dsh-plugin-whale
